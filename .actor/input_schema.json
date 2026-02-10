@@ -1,0 +1,73 @@
+{
+    "title": "Facebook Ads Library Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "startURLs": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "List of Facebook Ads Library URLs to scrape directly. If provided, takes precedence over search/country/adType parameters.",
+            "prefill": [],
+            "editor": "stringList",
+            "items": {
+                "type": "string",
+                "pattern": "https://www\\.facebook\\.com/ads/library/.*"
+            }
+        },
+        "search": {
+            "title": "Search keyword",
+            "type": "string",
+            "description": "Keyword to search for ads. Requires 'country' and 'adType' parameters.",
+            "editor": "textfield"
+        },
+        "country": {
+            "title": "Country",
+            "type": "string",
+            "description": "Two-letter country code (e.g. BR, US, GB, PT). Required when using 'search'.",
+            "default": "BR",
+            "editor": "textfield"
+        },
+        "adType": {
+            "title": "Ad Type",
+            "type": "string",
+            "description": "Type/category of ads to scrape.",
+            "enum": ["ALL", "POLITICAL_AND_ISSUE_ADS", "HOUSING", "CREDIT", "EMPLOYMENT", "ISSUE_ADS"],
+            "default": "ALL",
+            "editor": "select"
+        },
+        "activeStatus": {
+            "title": "Active Status",
+            "type": "string",
+            "description": "Filter ads by active/inactive status.",
+            "enum": ["ALL", "ACTIVE", "INACTIVE"],
+            "default": "ALL",
+            "editor": "select"
+        },
+        "maxItems": {
+            "title": "Max items",
+            "type": "integer",
+            "description": "Maximum number of ads to scrape. 0 means unlimited.",
+            "default": 100,
+            "minimum": 0,
+            "editor": "number"
+        },
+        "endPage": {
+            "title": "End page",
+            "type": "integer",
+            "description": "Maximum number of result pages to scrape. 0 means unlimited.",
+            "default": 0,
+            "minimum": 0,
+            "editor": "number"
+        },
+        "proxy": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Proxy settings. Residential proxies are strongly recommended for Facebook scraping.",
+            "editor": "proxy",
+            "prefill": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    }
+}

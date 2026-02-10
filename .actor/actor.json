@@ -1,0 +1,13 @@
+{
+    "actorSpecification": 1,
+    "name": "facebook-ads-library-scraper",
+    "title": "Facebook Ads Library Scraper",
+    "description": "Scrapes ads from the Facebook Ad Library. Supports keyword search, country filter, ad type filter and pagination.",
+    "version": "1.0.0",
+    "input": "./input_schema.json",
+    "defaultRunOptions": {
+        "build": "latest",
+        "memoryMbytes": 2048,
+        "timeoutSecs": 3600
+    }
+}
