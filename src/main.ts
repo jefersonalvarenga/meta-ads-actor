@@ -139,6 +139,22 @@ interface ProcessedAd {
 const AD_LIBRARY_BASE = 'https://www.facebook.com/ads/library/';
 const GRAPHQL_URL_PATTERN = 'facebook.com/api/graphql';
 
+// Map input schema values to Facebook URL parameter values
+const AD_TYPE_MAP: Record<string, string> = {
+    'ALL': 'all',
+    'POLITICAL_AND_ISSUE_ADS': 'political_and_issue_ads',
+    'HOUSING': 'housing',
+    'CREDIT': 'credit',
+    'EMPLOYMENT': 'employment',
+    'ISSUE_ADS': 'political_and_issue_ads',
+};
+
+const ACTIVE_STATUS_MAP: Record<string, string> = {
+    'ALL': 'all',
+    'ACTIVE': 'active',
+    'INACTIVE': 'inactive',
+};
+
 function buildSearchURL(params: {
     search?: string;
     country?: string;
@@ -146,8 +162,10 @@ function buildSearchURL(params: {
     activeStatus?: string;
 }): string {
     const url = new URL(AD_LIBRARY_BASE);
-    url.searchParams.set('active_status', (params.activeStatus ?? 'ALL').toLowerCase());
-    url.searchParams.set('ad_type', params.adType ?? 'ALL');
+    const adTypeRaw = (params.adType ?? 'ALL').toUpperCase();
+    const activeStatusRaw = (params.activeStatus ?? 'ALL').toUpperCase();
+    url.searchParams.set('active_status', ACTIVE_STATUS_MAP[activeStatusRaw] ?? 'all');
+    url.searchParams.set('ad_type', AD_TYPE_MAP[adTypeRaw] ?? 'all');
     url.searchParams.set('country', (params.country ?? 'BR').toUpperCase());
     url.searchParams.set('media_type', 'all');
     if (params.search) {
@@ -412,6 +430,7 @@ const initialURLs: string[] =
         : [buildSearchURL({ search, country, adType, activeStatus })];
 
 crawleeLog.info(`Starting scrape for ${initialURLs.length} URL(s). maxItems=${maxItems}, endPage=${endPage}`);
+crawleeLog.info(`Initial URLs: ${JSON.stringify(initialURLs)}`);
 
 // Proxy setup
 let proxyConfiguration: ProxyConfiguration | undefined;
