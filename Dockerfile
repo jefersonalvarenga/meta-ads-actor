@@ -5,17 +5,17 @@ FROM apify/actor-node-playwright-chrome:20
 # Copy package files first for Docker layer caching
 COPY package*.json ./
 
-# Install npm dependencies, skip optional and avoid running Playwright install
-# since it's already bundled in the image
+# Install all dependencies (including devDependencies) to have tsc available
 RUN npm --quiet set progress=false \
-    && npm install --only=prod --no-optional \
+    && npm install --no-optional \
     && echo "All npm dependencies installed"
 
 # Copy the rest of the source code
 COPY . ./
 
-# Build TypeScript
-RUN npm run build
+# Build TypeScript, then remove devDependencies to keep image lean
+RUN npm run build \
+    && npm prune --production
 
 # Specify default command
 CMD npm run start
