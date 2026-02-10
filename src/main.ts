@@ -151,7 +151,10 @@ function buildSearchURL(params: {
     url.searchParams.set('country', (params.country ?? 'BR').toUpperCase());
     url.searchParams.set('media_type', 'all');
     if (params.search) {
-        url.searchParams.set('q', params.search);
+        // Decode first to avoid double-encoding if the value arrived already percent-encoded
+        let searchVal = params.search;
+        try { searchVal = decodeURIComponent(params.search); } catch { /* keep as-is */ }
+        url.searchParams.set('q', searchVal);
     }
     return url.toString();
 }
@@ -367,10 +370,33 @@ const {
     proxy,
 } = input;
 
+// Session-specific params that vary per browser/session and should be stripped
+const SESSION_PARAMS = ['search_run_id', 'sort_data', 'is_targeted_country'];
+
+function cleanAdLibraryUrl(rawUrl: string): string {
+    try {
+        const url = new URL(rawUrl);
+        for (const param of SESSION_PARAMS) {
+            // Remove exact match and bracket variants like sort_data[mode]
+            for (const key of [...url.searchParams.keys()]) {
+                if (key === param || key.startsWith(`${param}[`)) {
+                    url.searchParams.delete(key);
+                }
+            }
+        }
+        return url.toString();
+    } catch {
+        return rawUrl;
+    }
+}
+
 // Normalise startUrls: accept both key names and both string[] and {url}[] formats
 function normaliseUrls(raw: Array<string | StartUrl> | undefined): string[] {
     if (!raw || raw.length === 0) return [];
-    return raw.map((item) => (typeof item === 'string' ? item : item.url)).filter(Boolean);
+    return raw
+        .map((item) => (typeof item === 'string' ? item : item.url))
+        .filter(Boolean)
+        .map(cleanAdLibraryUrl);
 }
 
 const startURLs = normaliseUrls(input.startURLs ?? input.startUrls);
