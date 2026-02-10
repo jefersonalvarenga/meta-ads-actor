@@ -23,6 +23,9 @@ interface Input {
         apifyProxyGroups?: string[];
         proxyUrls?: string[];
     };
+    // Free-form object passed through to every output record — useful for
+    // identifying the scrape job when chaining multiple Apify actors.
+    customData?: Record<string, unknown>;
 }
 
 interface SpendRange {
@@ -132,6 +135,7 @@ interface ProcessedAd {
     regionDistribution: RegionEntry[];
     scrapedAt: string;
     sourceURL: string;
+    customData: Record<string, unknown> | null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -188,7 +192,7 @@ function extractText(body: AdSnapshot['body']): string {
     return body?.markup?.__html?.replace(/<[^>]+>/g, '') ?? '';
 }
 
-function processAd(raw: RawAd, sourceURL: string): ProcessedAd | null {
+function processAd(raw: RawAd, sourceURL: string, customData: Record<string, unknown> | null = null): ProcessedAd | null {
     const id = raw.adArchiveID ?? raw.adid ?? raw.ad_archive_id;
     if (!id) return null;
 
@@ -269,6 +273,7 @@ function processAd(raw: RawAd, sourceURL: string): ProcessedAd | null {
         regionDistribution: raw.regionDistribution ?? [],
         scrapedAt: new Date().toISOString(),
         sourceURL,
+        customData,
     };
 }
 
@@ -337,7 +342,7 @@ function findAdsInObject(obj: unknown, depth = 0): RawAd[] {
  * Facebook embeds ad data in inline <script> tags using require() / __d() patterns.
  * We grab the full HTML and search for JSON chunks containing ad archive IDs.
  */
-async function extractAdsFromDOM(page: Page, sourceURL: string): Promise<ProcessedAd[]> {
+async function extractAdsFromDOM(page: Page, sourceURL: string, customData: Record<string, unknown> | null = null): Promise<ProcessedAd[]> {
     const ads: ProcessedAd[] = [];
     try {
         const html = await page.content();
@@ -382,7 +387,7 @@ async function extractAdsFromDOM(page: Page, sourceURL: string): Promise<Process
             try {
                 const parsed = JSON.parse(chunk);
                 if (isAdObject(parsed as Record<string, unknown>)) {
-                    const processed = processAd(parsed as unknown as RawAd, sourceURL);
+                    const processed = processAd(parsed as unknown as RawAd, sourceURL, customData);
                     if (processed && !ads.find(a => a.adArchiveID === processed.adArchiveID)) {
                         ads.push(processed);
                     }
@@ -411,6 +416,7 @@ const {
     maxItems = 100,
     endPage = 0,
     proxy,
+    customData = null,
 } = input;
 
 // Session-specific params that vary per browser/session and should be stripped
@@ -678,7 +684,7 @@ const crawler = new PlaywrightCrawler({
         // If network interception found no ads, try DOM extraction
         if (collectedAds.length === 0) {
             log.warning('No ads found via network interception, trying DOM fallback...');
-            const domAds = await extractAdsFromDOM(page, sourceURL);
+            const domAds = await extractAdsFromDOM(page, sourceURL, customData);
             if (domAds.length > 0) {
                 log.info(`DOM fallback found ${domAds.length} ads`);
                 for (const ad of domAds) {
@@ -695,7 +701,7 @@ const crawler = new PlaywrightCrawler({
         // Process and save intercepted ads
         for (const raw of collectedAds) {
             if (maxItems > 0 && totalScraped >= maxItems) break;
-            const processed = processAd(raw, sourceURL);
+            const processed = processAd(raw, sourceURL, customData);
             if (!processed) continue;
             if (seenAdIDs.has(processed.adArchiveID)) continue;
             seenAdIDs.add(processed.adArchiveID);

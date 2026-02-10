@@ -64,6 +64,12 @@
                 "useApifyProxy": true,
                 "apifyProxyGroups": ["RESIDENTIAL"]
             }
+        },
+        "customData": {
+            "title": "Custom data",
+            "type": "object",
+            "description": "Free-form JSON object passed through to every output record. Useful for identifying the scrape job when chaining actors (e.g. { \"search_run_id\": \"abc-123\", \"client_id\": \"456\" }).",
+            "editor": "json"
         }
     }
 }
