@@ -459,16 +459,23 @@ crawleeLog.info(`Initial URLs: ${JSON.stringify(initialURLs)}`);
 
 // Proxy setup
 let proxyConfiguration: ProxyConfiguration | undefined;
+crawleeLog.info(`Proxy input: ${JSON.stringify(proxy)}`);
 if (proxy?.useApifyProxy !== false) {
+    const groups = proxy?.apifyProxyGroups ?? ['RESIDENTIAL'];
+    crawleeLog.info(`Using Apify proxy, groups: ${JSON.stringify(groups)}, countryCode: ${country.toUpperCase()}`);
     proxyConfiguration = await Actor.createProxyConfiguration({
-        groups: proxy?.apifyProxyGroups ?? ['RESIDENTIAL'],
+        groups,
         countryCode: country.toUpperCase(),
     });
 } else if (proxy?.proxyUrls && proxy.proxyUrls.length > 0) {
+    crawleeLog.info(`Using custom proxy URLs: ${proxy.proxyUrls.length} URL(s)`);
     proxyConfiguration = await Actor.createProxyConfiguration({
         proxyUrls: proxy.proxyUrls,
     });
+} else {
+    crawleeLog.warning('No proxy configured — Facebook will likely block datacenter IPs!');
 }
+crawleeLog.info(`Proxy configuration created: ${proxyConfiguration ? 'yes' : 'no (undefined)'}`);
 
 let totalScraped = 0;
 const seenAdIDs = new Set<string>();
