@@ -410,13 +410,8 @@ const crawler = new PlaywrightCrawler({
     navigationTimeoutSecs: 90,
 
     maxSessionRotations: 10,
-    // retryOnBlocked: true enables session rotation on blocked requests.
-    // blockedStatusCodes: [] overrides the default list (which includes 403)
-    // so crawlee retires the session but does NOT throw — our errorHandler handles it.
-    retryOnBlocked: true,
     sessionPoolOptions: {
         maxPoolSize: 20,
-        blockedStatusCodes: [],
         sessionOptions: { maxUsageCount: 3 },
     },
 
@@ -466,14 +461,40 @@ const crawler = new PlaywrightCrawler({
                 'sec-ch-ua-platform': '"Windows"',
                 'Upgrade-Insecure-Requests': '1',
             });
+            // Intercept the main document response: if Facebook returns 403, fulfill
+            // with status 200 so crawlee's block-detection does not abort the request.
+            // The actual page content will be a 403 page, but our requestHandler
+            // can detect this and the errorHandler will retire the session for retry.
+            await page.route('**/ads/library/**', async (route) => {
+                const response = await route.fetch();
+                if (response.status() === 403) {
+                    // Return the 403 body but with status 200 to bypass crawlee's check
+                    await route.fulfill({
+                        status: 200,
+                        headers: Object.fromEntries(Object.entries(response.headers())),
+                        body: await response.body(),
+                    });
+                } else {
+                    await route.continue();
+                }
+            });
             // Random delay before navigation to appear more human
             await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
         },
     ],
 
-    async requestHandler({ request, page, log }) {
+    async requestHandler({ request, page, log, session }) {
         const sourceURL = request.url;
         log.info(`Processing URL: ${sourceURL}`);
+
+        // Check if we got a 403 page (our route interceptor converted it to 200)
+        const pageTitle = await page.title().catch(() => '');
+        const pageUrl = page.url();
+        if (pageUrl.includes('login') || pageTitle.toLowerCase().includes('log in') || pageTitle === '') {
+            log.warning(`Possible redirect to login page or empty page — retiring session`);
+            session?.retire();
+            throw new Error('Blocked: redirected to login or empty page');
+        }
 
         const collectedAds: RawAd[] = [];
 
