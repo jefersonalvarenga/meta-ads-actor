@@ -409,6 +409,12 @@ const crawler = new PlaywrightCrawler({
     requestHandlerTimeoutSecs: 120,
     navigationTimeoutSecs: 90,
 
+    maxSessionRotations: 10,
+    sessionPoolOptions: {
+        maxPoolSize: 20,
+        sessionOptions: { maxUsageCount: 3 },
+    },
+
     // Anti-detection settings
     launchContext: {
         launchOptions: {
@@ -418,10 +424,11 @@ const crawler = new PlaywrightCrawler({
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
                 '--lang=en-US,en',
             ],
         },
-        useChrome: false,
+        useChrome: true,
     },
 
     browserPoolOptions: {
@@ -429,20 +436,33 @@ const crawler = new PlaywrightCrawler({
             fingerprintGeneratorOptions: {
                 browsers: ['chrome'],
                 operatingSystems: ['windows', 'macos'],
+                locales: ['en-US'],
             },
         },
     },
 
     preNavigationHooks: [
         async ({ page }) => {
-            // Remove webdriver traces
+            // Override automation-detection properties
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
             });
-            // Set realistic Accept-Language
             await page.setExtraHTTPHeaders({
-                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'Upgrade-Insecure-Requests': '1',
             });
+            // Random delay before navigation to appear more human
+            await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
         },
     ],
 
@@ -570,8 +590,16 @@ const crawler = new PlaywrightCrawler({
         }
     },
 
+    errorHandler({ request, log, session }, error) {
+        const msg = error.message ?? '';
+        if (msg.includes('403') || msg.includes('blocked')) {
+            log.warning(`Blocked (403) on ${request.url} — retiring session and retrying`);
+            session?.retire();
+        }
+    },
+
     failedRequestHandler({ request, log }) {
-        log.error(`Request failed: ${request.url}`, { errorMessages: request.errorMessages });
+        log.error(`Request failed after all retries: ${request.url}`, { errorMessages: request.errorMessages });
     },
 });
 
