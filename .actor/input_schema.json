@@ -3,16 +3,12 @@
     "type": "object",
     "schemaVersion": 1,
     "properties": {
-        "startURLs": {
+        "startUrls": {
             "title": "Start URLs",
             "type": "array",
             "description": "List of Facebook Ads Library URLs to scrape directly. If provided, takes precedence over search/country/adType parameters.",
             "prefill": [],
-            "editor": "stringList",
-            "items": {
-                "type": "string",
-                "pattern": "https://www\\.facebook\\.com/ads/library/.*"
-            }
+            "editor": "requestListSources"
         },
         "search": {
             "title": "Search keyword",

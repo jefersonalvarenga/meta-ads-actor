@@ -4,8 +4,14 @@ import type { Page, Response } from 'playwright';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface StartUrl {
+    url: string;
+}
+
 interface Input {
-    startURLs?: string[];
+    // Accept both camelCase variants and array-of-objects format (Apify default)
+    startURLs?: Array<string | StartUrl>;
+    startUrls?: Array<string | StartUrl>;
     search?: string;
     country?: string;
     adType?: string;
@@ -352,7 +358,6 @@ await Actor.init();
 const input = (await Actor.getInput<Input>()) ?? {};
 
 const {
-    startURLs = [],
     search,
     country = 'BR',
     adType = 'ALL',
@@ -362,8 +367,16 @@ const {
     proxy,
 } = input;
 
+// Normalise startUrls: accept both key names and both string[] and {url}[] formats
+function normaliseUrls(raw: Array<string | StartUrl> | undefined): string[] {
+    if (!raw || raw.length === 0) return [];
+    return raw.map((item) => (typeof item === 'string' ? item : item.url)).filter(Boolean);
+}
+
+const startURLs = normaliseUrls(input.startURLs ?? input.startUrls);
+
 if (startURLs.length === 0 && !search) {
-    throw new Error('Provide either "startURLs" or "search" (+ country + adType) in the input.');
+    throw new Error('Provide either "startUrls" or "search" (+ country + adType) in the input.');
 }
 
 // Build initial request list
