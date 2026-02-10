@@ -442,7 +442,7 @@ const crawler = new PlaywrightCrawler({
     },
 
     preNavigationHooks: [
-        async ({ page }) => {
+        async ({ page, request }) => {
             // Override automation-detection properties
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -463,12 +463,9 @@ const crawler = new PlaywrightCrawler({
             });
             // Intercept the main document response: if Facebook returns 403, fulfill
             // with status 200 so crawlee's block-detection does not abort the request.
-            // The actual page content will be a 403 page, but our requestHandler
-            // can detect this and the errorHandler will retire the session for retry.
             await page.route('**/ads/library/**', async (route) => {
                 const response = await route.fetch();
                 if (response.status() === 403) {
-                    // Return the 403 body but with status 200 to bypass crawlee's check
                     await route.fulfill({
                         status: 200,
                         headers: Object.fromEntries(Object.entries(response.headers())),
@@ -478,6 +475,33 @@ const crawler = new PlaywrightCrawler({
                     await route.continue();
                 }
             });
+
+            // Register the GraphQL response collector BEFORE navigation so we
+            // don't miss responses that fire during/right after page load.
+            const collectedAds: RawAd[] = [];
+            const responseHandler = async (response: Response) => {
+                if (!response.url().includes(GRAPHQL_URL_PATTERN)) return;
+                const status = response.status();
+                if (status < 200 || status >= 300) return;
+                const contentType = response.headers()['content-type'] ?? '';
+                if (!contentType.includes('json') && !contentType.includes('javascript') && !contentType.includes('text')) return;
+                try {
+                    const text = await response.text();
+                    if (!text.includes('adArchiveID') && !text.includes('ad_archive_id')) return;
+                    const found = extractAdsFromGraphQL(text);
+                    if (found.length > 0) {
+                        collectedAds.push(...found);
+                    }
+                } catch {
+                    // response body may have been consumed already
+                }
+            };
+            page.on('response', responseHandler);
+
+            // Store collector on request userData so requestHandler can access it
+            request.userData['collectedAds'] = collectedAds;
+            request.userData['responseHandler'] = responseHandler;
+
             // Random delay before navigation to appear more human
             await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
         },
@@ -496,42 +520,21 @@ const crawler = new PlaywrightCrawler({
             throw new Error('Blocked: redirected to login or empty page');
         }
 
-        const collectedAds: RawAd[] = [];
+        // Retrieve the ad collector registered in preNavigationHook
+        const collectedAds: RawAd[] = (request.userData['collectedAds'] as RawAd[]) ?? [];
+        const responseHandler = request.userData['responseHandler'] as ((r: Response) => Promise<void>) | undefined;
 
-        // Intercept GraphQL responses from Facebook
-        const responseHandler = async (response: Response) => {
-            if (!response.url().includes(GRAPHQL_URL_PATTERN)) return;
-            if (!response.ok()) return;
-
-            const contentType = response.headers()['content-type'] ?? '';
-            if (!contentType.includes('json') && !contentType.includes('javascript')) return;
-
-            try {
-                const text = await response.text();
-                if (!text.includes('adArchiveID') && !text.includes('ad_archive_id')) return;
-                const found = extractAdsFromGraphQL(text);
-                if (found.length > 0) {
-                    log.debug(`Found ${found.length} ads in GraphQL response`);
-                    collectedAds.push(...found);
-                }
-            } catch {
-                // Some responses can't be read (e.g., already consumed)
-            }
-        };
-
-        page.on('response', responseHandler);
-
-        // Wait for the page to load and ads to appear
+        // Wait for the page to fully load and GraphQL calls to complete
         try {
             await page.waitForLoadState('networkidle', { timeout: 30000 });
         } catch {
             await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
         }
 
-        // Give extra time for GraphQL calls to complete
-        await page.waitForTimeout(3000);
+        // Extra wait for late GraphQL responses
+        await page.waitForTimeout(4000);
 
-        page.off('response', responseHandler);
+        if (responseHandler) page.off('response', responseHandler);
 
         // If network interception found no ads, try DOM extraction
         if (collectedAds.length === 0) {
