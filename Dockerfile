@@ -5,17 +5,16 @@ FROM apify/actor-node-playwright-chrome:20
 # Copy package files first for Docker layer caching
 COPY package*.json ./
 
-# Install all dependencies (including devDependencies) to have tsc available
+# Install production dependencies (typescript is a dependency, not devDependency)
 RUN npm --quiet set progress=false \
-    && npm install --no-optional \
+    && npm install --omit=dev \
     && echo "All npm dependencies installed"
 
 # Copy the rest of the source code
 COPY . ./
 
-# Build TypeScript, then remove devDependencies to keep image lean
-RUN npm run build \
-    && npm prune --production
+# Build TypeScript
+RUN node_modules/.bin/tsc -p tsconfig.json
 
 # Specify default command
 CMD npm run start
