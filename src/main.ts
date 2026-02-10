@@ -333,40 +333,65 @@ function findAdsInObject(obj: unknown, depth = 0): RawAd[] {
 }
 
 /**
- * Extracts ads from the page DOM as a fallback when network interception fails.
+ * Extracts ads from the page HTML.
+ * Facebook embeds ad data in inline <script> tags using require() / __d() patterns.
+ * We grab the full HTML and search for JSON chunks containing ad archive IDs.
  */
 async function extractAdsFromDOM(page: Page, sourceURL: string): Promise<ProcessedAd[]> {
     const ads: ProcessedAd[] = [];
     try {
-        // Facebook inlines ad data in __SSR_INITIAL_DATA__ or similar window variables
-        const rawData = await page.evaluate(() => {
-            // Try to find ad data in window.__INITIAL_DATA_FOR_REHYDRATION__ or similar
-            const scripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
-            for (const script of scripts) {
-                const text = script.textContent ?? '';
-                if (text.includes('adArchiveID') || text.includes('ad_archive_id')) {
-                    return text;
-                }
-            }
-            // Try to read from inline scripts
-            const allScripts = Array.from(document.querySelectorAll('script:not([src])'));
-            for (const script of allScripts) {
-                const text = script.textContent ?? '';
-                if (text.includes('adArchiveID') || text.includes('ad_archive_id')) {
-                    return text;
-                }
-            }
-            return null;
-        });
+        const html = await page.content();
+        if (!html.includes('adArchiveID') && !html.includes('ad_archive_id')) return ads;
 
-        if (rawData) {
-            const rawAds = extractAdsFromGraphQL(rawData);
-            for (const raw of rawAds) {
-                const processed = processAd(raw, sourceURL);
-                if (processed) ads.push(processed);
+        // Extract all JSON-like blobs from the HTML.
+        // Facebook wraps data in: require("TimeSliceImpl").collectDataForCapture(...)
+        // or: __d("...",[],(function(...){})); or plain JSON objects in <script> tags.
+        // Strategy: find all occurrences of adArchiveID and extract surrounding JSON object.
+        const marker = '"adArchiveID"';
+        let pos = 0;
+        while (pos < html.length) {
+            const idx = html.indexOf(marker, pos);
+            if (idx === -1) break;
+            pos = idx + marker.length;
+
+            // Walk back to find the opening '{' of the object containing this key
+            let depth = 0;
+            let start = -1;
+            for (let i = idx; i >= Math.max(0, idx - 5000); i--) {
+                if (html[i] === '}') depth++;
+                else if (html[i] === '{') {
+                    if (depth === 0) { start = i; break; }
+                    depth--;
+                }
+            }
+            if (start === -1) continue;
+
+            // Walk forward to find the matching closing '}'
+            depth = 0;
+            let end = -1;
+            for (let i = start; i < Math.min(html.length, start + 50000); i++) {
+                if (html[i] === '{') depth++;
+                else if (html[i] === '}') {
+                    depth--;
+                    if (depth === 0) { end = i; break; }
+                }
+            }
+            if (end === -1) continue;
+
+            const chunk = html.slice(start, end + 1);
+            try {
+                const parsed = JSON.parse(chunk);
+                if (isAdObject(parsed as Record<string, unknown>)) {
+                    const processed = processAd(parsed as unknown as RawAd, sourceURL);
+                    if (processed && !ads.find(a => a.adArchiveID === processed.adArchiveID)) {
+                        ads.push(processed);
+                    }
+                }
+            } catch {
+                // chunk is not valid standalone JSON — skip
             }
         }
-    } catch (err) {
+    } catch {
         // DOM fallback silently fails
     }
     return ads;
@@ -626,8 +651,11 @@ const crawler = new PlaywrightCrawler({
                     await page.waitForLoadState('networkidle', { timeout: 20000 });
                 } catch { /* ignore */ }
             }
-            // Extra wait for GraphQL responses that arrive after DOM paint
-            await page.waitForTimeout(5000);
+            // Scroll down to trigger lazy-loaded GraphQL requests for more ads
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+            await page.waitForTimeout(2000);
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await page.waitForTimeout(3000);
             if (responseHandler) page.off('response', responseHandler);
         }
 
