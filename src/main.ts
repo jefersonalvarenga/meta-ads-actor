@@ -531,26 +531,44 @@ const crawler = new PlaywrightCrawler({
         const collectedAds: RawAd[] = (request.userData['collectedAds'] as RawAd[]) ?? [];
         const responseHandler = request.userData['responseHandler'] as ((r: Response) => Promise<void>) | undefined;
 
-        // Wait for the page to fully load and GraphQL calls to complete
-        try {
-            await page.waitForLoadState('networkidle', { timeout: 30000 });
-        } catch {
-            await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        // Facebook sometimes does a /rd_verify challenge that strips URL params.
+        // If the current URL lost its query params, navigate back to the original URL.
+        const currentUrl = page.url();
+        const hasQueryParams = currentUrl.includes('q=') || currentUrl.includes('search_type=');
+        if (!hasQueryParams && sourceURL.includes('q=')) {
+            log.info('URL params lost after challenge redirect — re-navigating to original URL');
+            if (responseHandler) page.off('response', responseHandler);
+            // Re-register collector for the second navigation
+            const collectedAds2: RawAd[] = [];
+            const responseHandler2 = async (response: Response) => {
+                if (!response.url().includes(GRAPHQL_URL_PATTERN)) return;
+                if (response.status() < 200 || response.status() >= 300) return;
+                try {
+                    const text = await response.text();
+                    if (!text.includes('adArchiveID') && !text.includes('ad_archive_id')) return;
+                    const found = extractAdsFromGraphQL(text);
+                    if (found.length > 0) collectedAds2.push(...found);
+                } catch { /* consumed */ }
+            };
+            page.on('response', responseHandler2);
+            await page.goto(sourceURL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForTimeout(6000);
+            page.off('response', responseHandler2);
+            collectedAds.push(...collectedAds2);
+        } else {
+            // Wait for the page to fully load and GraphQL calls to complete
+            try {
+                await page.waitForLoadState('networkidle', { timeout: 30000 });
+            } catch {
+                await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+            }
+            // Extra wait for late GraphQL responses
+            await page.waitForTimeout(4000);
+            if (responseHandler) page.off('response', responseHandler);
         }
 
-        // Extra wait for late GraphQL responses
-        await page.waitForTimeout(4000);
-
-        if (responseHandler) page.off('response', responseHandler);
-
-        // --- Diagnostic logging ---
-        const seenNetworkUrls = (request.userData['seenNetworkUrls'] as string[]) ?? [];
         log.info(`Page title: "${pageTitle}" | URL after load: ${page.url()}`);
         log.info(`GraphQL ads collected via network: ${collectedAds.length}`);
-        log.info(`Network requests seen (first 30): ${JSON.stringify(seenNetworkUrls)}`);
-        const bodySnippet = await page.evaluate(() => document.body?.innerText?.slice(0, 300) ?? '').catch(() => '');
-        log.info(`Page body snippet: ${bodySnippet.replace(/\n/g, ' ')}`);
-        // --------------------------
 
         // If network interception found no ads, try DOM extraction
         if (collectedAds.length === 0) {
