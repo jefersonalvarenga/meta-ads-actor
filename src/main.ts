@@ -479,9 +479,15 @@ const crawler = new PlaywrightCrawler({
             // Register the GraphQL response collector BEFORE navigation so we
             // don't miss responses that fire during/right after page load.
             const collectedAds: RawAd[] = [];
+            const seenNetworkUrls: string[] = [];
             const responseHandler = async (response: Response) => {
-                if (!response.url().includes(GRAPHQL_URL_PATTERN)) return;
+                const url = response.url();
                 const status = response.status();
+                // Log ALL network requests for diagnosis (first 30)
+                if (seenNetworkUrls.length < 30) {
+                    seenNetworkUrls.push(`${status} ${url.slice(0, 120)}`);
+                }
+                if (!url.includes(GRAPHQL_URL_PATTERN)) return;
                 if (status < 200 || status >= 300) return;
                 const contentType = response.headers()['content-type'] ?? '';
                 if (!contentType.includes('json') && !contentType.includes('javascript') && !contentType.includes('text')) return;
@@ -501,6 +507,7 @@ const crawler = new PlaywrightCrawler({
             // Store collector on request userData so requestHandler can access it
             request.userData['collectedAds'] = collectedAds;
             request.userData['responseHandler'] = responseHandler;
+            request.userData['seenNetworkUrls'] = seenNetworkUrls;
 
             // Random delay before navigation to appear more human
             await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
@@ -535,6 +542,15 @@ const crawler = new PlaywrightCrawler({
         await page.waitForTimeout(4000);
 
         if (responseHandler) page.off('response', responseHandler);
+
+        // --- Diagnostic logging ---
+        const seenNetworkUrls = (request.userData['seenNetworkUrls'] as string[]) ?? [];
+        log.info(`Page title: "${pageTitle}" | URL after load: ${page.url()}`);
+        log.info(`GraphQL ads collected via network: ${collectedAds.length}`);
+        log.info(`Network requests seen (first 30): ${JSON.stringify(seenNetworkUrls)}`);
+        const bodySnippet = await page.evaluate(() => document.body?.innerText?.slice(0, 300) ?? '').catch(() => '');
+        log.info(`Page body snippet: ${bodySnippet.replace(/\n/g, ' ')}`);
+        // --------------------------
 
         // If network interception found no ads, try DOM extraction
         if (collectedAds.length === 0) {
