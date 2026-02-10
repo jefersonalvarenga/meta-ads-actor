@@ -410,8 +410,13 @@ const crawler = new PlaywrightCrawler({
     navigationTimeoutSecs: 90,
 
     maxSessionRotations: 10,
+    // retryOnBlocked: true enables session rotation on blocked requests.
+    // blockedStatusCodes: [] overrides the default list (which includes 403)
+    // so crawlee retires the session but does NOT throw — our errorHandler handles it.
+    retryOnBlocked: true,
     sessionPoolOptions: {
         maxPoolSize: 20,
+        blockedStatusCodes: [],
         sessionOptions: { maxUsageCount: 3 },
     },
 
