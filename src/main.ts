@@ -489,10 +489,12 @@ const crawler = new PlaywrightCrawler({
                 }
                 if (!url.includes(GRAPHQL_URL_PATTERN)) return;
                 if (status < 200 || status >= 300) return;
-                const contentType = response.headers()['content-type'] ?? '';
-                if (!contentType.includes('json') && !contentType.includes('javascript') && !contentType.includes('text')) return;
                 try {
                     const text = await response.text();
+                    // Log every GraphQL hit regardless of content, for diagnosis
+                    if (seenNetworkUrls.length < 50 && text.length > 10) {
+                        seenNetworkUrls.push(`GQL[${status}] len=${text.length} has_ad=${text.includes('adArchiveID') || text.includes('ad_archive_id')}`);
+                    }
                     if (!text.includes('adArchiveID') && !text.includes('ad_archive_id')) return;
                     const found = extractAdsFromGraphQL(text);
                     if (found.length > 0) {
@@ -556,19 +558,42 @@ const crawler = new PlaywrightCrawler({
             page.off('response', responseHandler2);
             collectedAds.push(...collectedAds2);
         } else {
-            // Wait for the page to fully load and GraphQL calls to complete
-            try {
-                await page.waitForLoadState('networkidle', { timeout: 30000 });
-            } catch {
-                await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+            // Wait for ad cards to appear in the DOM, or fall back to networkidle
+            const adSelectors = [
+                '[data-testid="ad-archive-item"]',
+                'div[class*="x8gbvx8"]',       // FB ad card container class pattern
+                'div[class*="_7jyr"]',           // legacy FB ad card
+                'div[aria-label*="Ad"]',
+                'div[role="article"]',
+            ];
+            let adsAppeared = false;
+            for (const sel of adSelectors) {
+                try {
+                    await page.waitForSelector(sel, { timeout: 15000 });
+                    log.info(`Ad selector found: ${sel}`);
+                    adsAppeared = true;
+                    break;
+                } catch { /* try next */ }
             }
-            // Extra wait for late GraphQL responses
-            await page.waitForTimeout(4000);
+            if (!adsAppeared) {
+                log.warning('No ad selector appeared — waiting for networkidle as fallback');
+                try {
+                    await page.waitForLoadState('networkidle', { timeout: 20000 });
+                } catch { /* ignore */ }
+            }
+            // Extra wait for GraphQL responses that arrive after DOM paint
+            await page.waitForTimeout(5000);
             if (responseHandler) page.off('response', responseHandler);
         }
 
+        const seenNetworkUrls = (request.userData['seenNetworkUrls'] as string[]) ?? [];
         log.info(`Page title: "${pageTitle}" | URL after load: ${page.url()}`);
         log.info(`GraphQL ads collected via network: ${collectedAds.length}`);
+        log.info(`GraphQL responses seen: ${JSON.stringify(seenNetworkUrls)}`);
+        if (collectedAds.length === 0) {
+            const fullText = await page.evaluate(() => document.body?.innerText?.slice(0, 800) ?? '').catch(() => '');
+            log.info(`Full page text (800 chars): ${fullText.replace(/\n+/g, ' ')}`);
+        }
 
         // If network interception found no ads, try DOM extraction
         if (collectedAds.length === 0) {
