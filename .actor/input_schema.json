@@ -3,23 +3,23 @@
     "type": "object",
     "schemaVersion": 1,
     "properties": {
-        "startUrls": {
-            "title": "Start URLs",
-            "type": "array",
-            "description": "List of Facebook Ads Library URLs to scrape directly. If provided, takes precedence over search/country/adType parameters.",
-            "prefill": [],
-            "editor": "requestListSources"
+        "accessToken": {
+            "title": "Facebook Access Token",
+            "type": "string",
+            "description": "Facebook user access token with 'ads_read' permission. Get one at: https://developers.facebook.com/tools/explorer/ — select your App, click 'Generate Access Token', add permission 'ads_read'.",
+            "editor": "textfield",
+            "isSecret": true
         },
         "search": {
             "title": "Search keyword",
             "type": "string",
-            "description": "Keyword to search for ads. Requires 'country' and 'adType' parameters.",
+            "description": "Keyword to search for ads (e.g. 'cirurgia plástica').",
             "editor": "textfield"
         },
         "country": {
             "title": "Country",
             "type": "string",
-            "description": "Two-letter country code (e.g. BR, US, GB, PT). Required when using 'search'.",
+            "description": "Two-letter country code (e.g. BR, US, GB, PT).",
             "default": "BR",
             "editor": "textfield"
         },
@@ -27,7 +27,7 @@
             "title": "Ad Type",
             "type": "string",
             "description": "Type/category of ads to scrape.",
-            "enum": ["ALL", "POLITICAL_AND_ISSUE_ADS", "HOUSING", "CREDIT", "EMPLOYMENT", "ISSUE_ADS"],
+            "enum": ["ALL", "POLITICAL_AND_ISSUE_ADS", "HOUSING", "CREDIT", "EMPLOYMENT"],
             "default": "ALL",
             "editor": "select"
         },
@@ -47,35 +47,12 @@
             "minimum": 0,
             "editor": "number"
         },
-        "endPage": {
-            "title": "End page",
-            "type": "integer",
-            "description": "Maximum number of result pages to scrape. 0 means unlimited.",
-            "default": 0,
-            "minimum": 0,
-            "editor": "number"
-        },
-        "proxyCountry": {
-            "title": "Proxy country",
-            "type": "string",
-            "description": "Two-letter country code for the proxy exit node (e.g. US, BR, GB). Leave empty to let Apify choose automatically. Set this independently from the search country — e.g. search BR ads via a US proxy.",
-            "editor": "textfield"
-        },
-        "proxy": {
-            "title": "Proxy configuration",
-            "type": "object",
-            "description": "Proxy settings. Residential proxies are strongly recommended for Facebook scraping.",
-            "editor": "proxy",
-            "prefill": {
-                "useApifyProxy": true,
-                "apifyProxyGroups": ["RESIDENTIAL"]
-            }
-        },
         "customData": {
             "title": "Custom data",
             "type": "object",
-            "description": "Free-form JSON object passed through to every output record. Useful for identifying the scrape job when chaining actors (e.g. { \"search_run_id\": \"abc-123\", \"client_id\": \"456\" }).",
+            "description": "Free-form JSON object passed through to every output record. Useful for identifying the scrape job when chaining actors.",
             "editor": "json"
         }
-    }
+    },
+    "required": ["accessToken", "search"]
 }
