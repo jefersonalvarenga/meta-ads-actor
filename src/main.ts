@@ -357,14 +357,38 @@ async function fetchFbTokensViaBrowser(
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
 
-            // Scroll to trigger lazy-loaded ad responses
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-            await page.waitForTimeout(1500);
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch { /* ok */ }
-            await page.waitForTimeout(1000);
-
+            // Scroll repeatedly to trigger lazy-loaded ad batches.
+            // Each scroll to the bottom causes the React feed to fetch the next
+            // async/search_ads page — we capture those responses via page.on('response').
+            const targetItems = (request.userData['maxItems'] as number) ?? 100;
             const capturedBodies: string[] = (request.userData['capturedBodies'] as string[]) ?? [];
+
+            let lastCapturedCount = 0;
+            let noNewResponseRounds = 0;
+            const MAX_NO_NEW_ROUNDS = 3; // stop if 3 consecutive scrolls yield nothing new
+
+            for (let scrollRound = 0; scrollRound < 20; scrollRound++) {
+                // Count ads captured so far (rough estimate: ~30 per response)
+                const estimatedAds = capturedBodies.length * 30;
+                if (targetItems > 0 && estimatedAds >= targetItems) break;
+
+                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+                try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch { /* ok */ }
+                await page.waitForTimeout(800);
+
+                if (capturedBodies.length === lastCapturedCount) {
+                    noNewResponseRounds++;
+                    if (noNewResponseRounds >= MAX_NO_NEW_ROUNDS) {
+                        log.info(`No new responses after ${MAX_NO_NEW_ROUNDS} scroll rounds — stopping`);
+                        break;
+                    }
+                } else {
+                    noNewResponseRounds = 0;
+                    lastCapturedCount = capturedBodies.length;
+                    log.info(`Scroll round ${scrollRound + 1}: ${capturedBodies.length} response(s) captured so far`);
+                }
+            }
+
             log.info(`Captured ${capturedBodies.length} search response(s) from browser network`);
 
             const html = await page.content();
