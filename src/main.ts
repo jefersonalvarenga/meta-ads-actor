@@ -562,101 +562,97 @@ async function fetchFbTokensViaBrowser(
             const cookieHeader = cookieMapToHeader(cookieMap);
             log.info(`Browser cookies: ${Object.keys(cookieMap).join(', ')}`);
 
-            // Extract lsd from HTML (needed for HTTP fallback pagination)
-            const { lsd } = extractTokensFromHtml(html);
+            // Extract tokens from HTML
+            const { dtsg, lsd } = extractTokensFromHtml(html);
 
-            // Extract dtsg via page.evaluate — use the browser's own fetch to POST
-            // async/search_ads with all session cookies automatically included.
-            // This is more reliable than HTTP because there's no IP/cookie mismatch.
-            const adTypeValue = AD_TYPE_MAP[(searchUrl.includes('ad_type=') ? new URL(searchUrl).searchParams.get('ad_type') ?? 'all' : 'all')];
-            const activeStatusValue = ACTIVE_STATUS_MAP[(searchUrl.includes('active_status=') ? new URL(searchUrl).searchParams.get('active_status') ?? 'all' : 'all')];
+            // Also try window.__bbox for dtsg
+            let dtsgFinal = dtsg;
+            if (!dtsgFinal) {
+                try {
+                    dtsgFinal = await page.evaluate((): string => {
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        const bbox = (window as any).__bbox;
+                        if (!bbox) return '';
+                        function find(obj: unknown, d: number): string {
+                            if (d > 6 || !obj || typeof obj !== 'object') return '';
+                            const r = obj as Record<string, unknown>;
+                            if (typeof r['token'] === 'string' && (r['token'] as string).startsWith('AQ')) return r['token'] as string;
+                            for (const v of Object.values(r)) { const t = find(v, d + 1); if (t) return t; }
+                            return '';
+                        }
+                        return find(bbox, 0);
+                    });
+                } catch { /* ignore */ }
+            }
+            log.info(`Tokens — dtsg: ${dtsgFinal ? 'OK' : 'MISSING'}, lsd: ${lsd ? 'OK' : 'MISSING'}`);
+
+            const adTypeValue = AD_TYPE_MAP[new URL(searchUrl).searchParams.get('ad_type') ?? 'all'] ?? 'all';
+            const activeStatusValue = ACTIVE_STATUS_MAP[new URL(searchUrl).searchParams.get('active_status') ?? 'all'] ?? 'all';
             const qValue = new URL(searchUrl).searchParams.get('q') ?? '';
             const countryValue = (new URL(searchUrl).searchParams.get('country') ?? 'BR').toUpperCase();
 
-            // Fetch page 1 via browser's own fetch (cookies + CSRF automatically handled)
+            // Use page.context().request to POST directly from the browser's network context.
+            // This reuses the browser's cookie jar (including rd_challenge, xs, datr) and
+            // the same proxy IP — unlike gotScraping which is a separate Node HTTP client.
             const capturedBodies: string[] = [];
             const pageSize = 30;
             const maxPages = Math.ceil((request.userData['maxItems'] as number ?? 100) / pageSize);
+            const browserRequest = page.context().request;
 
             for (let page_i = 0; page_i < maxPages; page_i++) {
                 const offset = page_i * pageSize;
-                log.info(`Browser fetch: async/search_ads page ${page_i + 1}, offset=${offset}`);
+                log.info(`Browser context POST: async/search_ads page ${page_i + 1}, offset=${offset}`);
                 try {
-                    const responseText = await page.evaluate(async (params: {
-                        q: string; country: string; adType: string; activeStatus: string;
-                        count: number; offset: number;
-                    }): Promise<string> => {
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        const w = window as any;
-                        // Get dtsg from window store
-                        let dtsg = '';
-                        try {
-                            const bbox = w.__bbox;
-                            function findToken(obj: unknown, d: number): string {
-                                if (d > 6 || !obj || typeof obj !== 'object') return '';
-                                const r = obj as Record<string, unknown>;
-                                if (typeof r['token'] === 'string' && (r['token'] as string).startsWith('AQ')) return r['token'] as string;
-                                for (const v of Object.values(r)) { const t = findToken(v, d + 1); if (t) return t; }
-                                return '';
-                            }
-                            if (bbox) dtsg = findToken(bbox, 0);
-                        } catch { /* ignore */ }
-                        // Get lsd from meta tag or inline script
-                        if (!dtsg) {
-                            const m = document.body.innerHTML.match(/"token"\s*:\s*"(AQ[^"]{10,})"/);
-                            if (m) dtsg = m[1];
-                        }
-                        const lsdMeta = document.querySelector('input[name="lsd"]') as HTMLInputElement | null;
-                        const lsd = lsdMeta?.value ?? (document.body.innerHTML.match(/"LSD",\[\],\{"token":"([^"]+)"/))?.[1] ?? '';
+                    const formData: Record<string, string> = {
+                        q: qValue,
+                        count: String(pageSize),
+                        active_status: activeStatusValue,
+                        ad_type: adTypeValue,
+                        countries: `["${countryValue}"]`,
+                        media_type: 'all',
+                        search_type: 'keyword_unordered',
+                        start_index: String(offset),
+                    };
+                    if (dtsgFinal) formData['fb_dtsg'] = dtsgFinal;
+                    if (lsd) formData['lsd'] = lsd;
 
-                        const body = new URLSearchParams({
-                            q: params.q,
-                            count: String(params.count),
-                            active_status: params.activeStatus,
-                            ad_type: params.adType,
-                            countries: `["${params.country}"]`,
-                            media_type: 'all',
-                            search_type: 'keyword_unordered',
-                            start_index: String(params.offset),
-                            ...(dtsg ? { fb_dtsg: dtsg } : {}),
-                            ...(lsd ? { lsd } : {}),
-                        });
-
-                        const resp = await fetch('https://www.facebook.com/ads/library/async/search_ads/', {
-                            method: 'POST',
+                    const resp = await browserRequest.post(
+                        'https://www.facebook.com/ads/library/async/search_ads/',
+                        {
+                            form: formData,
                             headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
                                 'X-Requested-With': 'XMLHttpRequest',
+                                'Referer': searchUrl,
+                                'Origin': 'https://www.facebook.com',
                                 'Accept': '*/*',
+                                'Accept-Language': 'en-US,en;q=0.9',
                             },
-                            credentials: 'include',
-                            body: body.toString(),
-                        });
-                        return await resp.text();
-                    }, { q: qValue, country: countryValue, adType: adTypeValue ?? 'all', activeStatus: activeStatusValue ?? 'all', count: pageSize, offset });
-
+                        },
+                    );
+                    const responseText = await resp.text();
                     const isHtml = responseText.trimStart().startsWith('<!');
                     const hasAds = responseText.includes('adArchiveID') || responseText.includes('ad_archive_id');
-                    log.info(`  Page ${page_i + 1}: ${responseText.length} chars, isHtml=${isHtml}, hasAds=${hasAds}`);
+                    log.info(`  Page ${page_i + 1}: ${responseText.length} chars, status=${resp.status()}, isHtml=${isHtml}, hasAds=${hasAds}`);
 
                     if (isHtml || !hasAds) {
                         log.info('  No ad data in response — stopping pagination');
                         if (page_i === 0) {
-                            // Log preview to diagnose
                             log.info(`  Response preview: ${responseText.slice(0, 400).replace(/\n/g, ' ')}`);
                         }
                         break;
                     }
                     capturedBodies.push(responseText);
+                    // Small polite delay between pages
+                    if (page_i < maxPages - 1) await page.waitForTimeout(300 + Math.floor(Math.random() * 400));
                 } catch (err) {
-                    log.error(`  Browser fetch failed on page ${page_i + 1}: ${(err as Error).message}`);
+                    log.error(`  Browser context POST failed on page ${page_i + 1}: ${(err as Error).message}`);
                     break;
                 }
             }
 
-            log.info(`Browser fetch complete: ${capturedBodies.length} page(s) with ad data captured`);
+            log.info(`Browser context POST complete: ${capturedBodies.length} page(s) with ad data captured`);
 
-            result = { cookies: cookieHeader, dtsg: '', lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
+            result = { cookies: cookieHeader, dtsg: dtsgFinal, lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
         },
 
         failedRequestHandler({ log }, error) {
