@@ -357,13 +357,47 @@ async function fetchFbTokensViaBrowser(
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
 
-            // Diagnostic: check if React/the ad feed actually mounted
-            const feedCheck = await page.evaluate((): string => {
-                const hasReact = !!(document.querySelector('[data-pagelet="AdsLibrary"]') ?? document.querySelector('[data-testid="ads-library-results"]') ?? document.querySelector('._8nfl'));
-                const bodyText = document.body.innerText.slice(0, 200).replace(/\n/g, ' ');
-                return `reactMounted=${hasReact}, bodyStart="${bodyText}"`;
-            });
-            log.info(`Feed check: ${feedCheck}`);
+            // Diagnostic: check cookies and page state
+            const browserCookiesEarly = await page.context().cookies();
+            const cookieNamesEarly = browserCookiesEarly.map(c => c.name).join(', ');
+            log.info(`Cookies after challenge: ${cookieNamesEarly}`);
+
+            const htmlAfterChallenge = await page.content();
+            const hasVerify = htmlAfterChallenge.includes('__rd_verify');
+            const hasLoginForm = htmlAfterChallenge.includes('login') || htmlAfterChallenge.includes('Log in');
+            const hasAdsLib = htmlAfterChallenge.includes('AdsLibrary') || htmlAfterChallenge.includes('ads/library');
+            log.info(`Page state: hasVerify=${hasVerify}, hasLoginForm=${hasLoginForm}, hasAdsLib=${hasAdsLib}, size=${htmlAfterChallenge.length}`);
+
+            // Wait for the ad feed to mount — up to 30 seconds.
+            // Facebook's React app can take a while to hydrate after the challenge clears.
+            const FEED_SELECTORS = [
+                '[data-pagelet="AdsLibrary"]',
+                '[data-testid="ads-library-results"]',
+                '._8nfl',
+                '[class*="x1qhmfi1"]',   // common Ads Library result container class
+                'div[role="feed"]',
+            ];
+            let feedMounted = false;
+            for (const selector of FEED_SELECTORS) {
+                try {
+                    await page.waitForSelector(selector, { timeout: 30000 });
+                    log.info(`Feed mounted — found selector: ${selector}`);
+                    feedMounted = true;
+                    break;
+                } catch { /* try next */ }
+            }
+
+            if (!feedMounted) {
+                // Log what we actually see for debugging
+                const bodySnippet = await page.evaluate((): string => document.body.innerText.slice(0, 500).replace(/\n/g, ' '));
+                log.warning(`Feed did NOT mount after 30s. Body snippet: "${bodySnippet}"`);
+                // Save screenshot for debugging
+                try {
+                    const screenshotBuf = await page.screenshot({ fullPage: false });
+                    await Actor.setValue('debug_screenshot', screenshotBuf, { contentType: 'image/png' });
+                    log.info('Debug screenshot saved to key-value store as "debug_screenshot"');
+                } catch { /* ignore */ }
+            }
 
             // Scroll repeatedly to trigger lazy-loaded ad batches.
             // Each scroll to the bottom causes the React feed to fetch the next
