@@ -45,13 +45,35 @@ interface RegionEntry {
 }
 
 interface AdSnapshot {
-    body?: { markup?: { __html?: string } } | string;
+    // body can be object with text/markup or plain string
+    body?: { text?: string; markup?: { __html?: string } } | string;
     title?: string;
     link_url?: string;
     link_description?: string;
     link_caption?: string;
-    images?: Array<{ original_image_url?: string; resized_image_url?: string }>;
-    videos?: Array<{ video_hd_url?: string; video_sd_url?: string; video_preview_image_url?: string }>;
+    caption?: string;
+    cta_type?: string;
+    cta_text?: string;
+    display_format?: string;
+    page_name?: string;
+    page_id?: string;
+    page_is_deleted?: boolean;
+    page_profile_picture_url?: string;
+    page_profile_uri?: string;
+    page_like_count?: number;
+    page_categories?: string[];
+    images?: Array<{
+        original_image_url?: string;
+        resized_image_url?: string;
+        watermarked_resized_image_url?: string;
+    }>;
+    videos?: Array<{
+        video_hd_url?: string;
+        video_sd_url?: string;
+        video_preview_image_url?: string;
+        watermarked_video_hd_url?: string;
+        watermarked_video_sd_url?: string;
+    }>;
     cards?: Array<{
         body?: string;
         title?: string;
@@ -62,15 +84,23 @@ interface AdSnapshot {
         video_hd_url?: string;
         video_sd_url?: string;
     }>;
-    cta_type?: string;
-    cta_text?: string;
+    extra_images?: Array<{ original_image_url?: string; resized_image_url?: string }>;
+    extra_videos?: Array<{ video_hd_url?: string; video_sd_url?: string }>;
+    extra_texts?: Array<{ text?: string }>;
+    extra_links?: string[];
+}
+
+interface ImpressionsWithIndex {
+    impressions_text?: string | null;
+    impressions_index?: number;
 }
 
 interface RawAd {
+    // camelCase (from Facebook internal GraphQL)
     adid?: string;
     adArchiveID?: string;
     archiveTypes?: string[];
-    categories?: number[];
+    categories?: Array<number | string>;
     collationCount?: number;
     collationID?: string;
     currency?: string;
@@ -91,10 +121,11 @@ interface RawAd {
     impressions?: SpendRange;
     demographicDistribution?: DemographicEntry[];
     regionDistribution?: RegionEntry[];
-    // Raw GraphQL response fields
+    // snake_case (from public actor / page HTML JSON blobs)
     ad_archive_id?: string;
     page_id?: string;
     page_name?: string;
+    page_is_deleted?: boolean;
     ad_delivery_start_time?: string;
     ad_delivery_stop_time?: string | null;
     ad_snapshot_url?: string;
@@ -102,13 +133,36 @@ interface RawAd {
     ad_creative_link_titles?: string[];
     ad_creative_link_descriptions?: string[];
     publisher_platforms?: string[];
+    publisher_platform?: string[];
     estimated_audience_size?: SpendRange;
+    is_active?: boolean;
+    start_date?: number;
+    end_date?: number | null;
+    collation_count?: number;
+    collation_id?: string;
+    impressions_with_index?: ImpressionsWithIndex;
+    gated_type?: string;
+    contains_digital_created_media?: boolean;
+    contains_sensitive_content?: boolean;
+    total_active_time?: number | null;
+    ad_library_url?: string;
+    url?: string;
+    total?: number;
+    position?: number;
+    ads_count?: number;
+    start_date_formatted?: string;
+    end_date_formatted?: string;
 }
 
 interface ProcessedAd {
     adArchiveID: string;
     pageName: string | null;
     pageID: string | null;
+    pageProfilePictureURL: string | null;
+    pageProfileURI: string | null;
+    pageCategories: string[];
+    pageLikeCount: number | null;
+    pageIsDeleted: boolean;
     entityType: string | null;
     startDate: string | null;
     endDate: string | null;
@@ -116,23 +170,32 @@ interface ProcessedAd {
     currency: string | null;
     spend: SpendRange | null;
     impressions: SpendRange | null;
+    impressionsWithIndex: ImpressionsWithIndex | null;
     estimatedAudienceSize: SpendRange | null;
     publisherPlatforms: string[];
-    snapshot: string | null;
-    categories: number[];
-    collationCount: number;
+    adLibraryURL: string | null;
+    categories: Array<number | string>;
+    collationCount: number | null;
+    collationID: string | null;
     instagramActorName: string | null;
-    pageIsDeleted: boolean;
-    pageProfilePictureURL: string | null;
-    pageCategories: string[];
+    // Creative fields
     adCreativeBodies: string[];
     adCreativeLinkTitles: string[];
     adCreativeLinkDescriptions: string[];
     adCreativeLinkCaptions: string[];
     adCreativeImages: string[];
     adCreativeVideos: string[];
+    adCreativeVideoPreviewImages: string[];
+    ctaText: string | null;
+    ctaType: string | null;
+    linkURL: string | null;
+    displayFormat: string | null;
+    extraTexts: string[];
+    extraLinks: string[];
+    // Distribution
     demographicDistribution: DemographicEntry[];
     regionDistribution: RegionEntry[];
+    // Meta
     scrapedAt: string;
     sourceURL: string;
     customData: Record<string, unknown> | null;
@@ -186,89 +249,149 @@ function epochToISO(epoch: number | null | undefined): string | null {
     return new Date(epoch * 1000).toISOString();
 }
 
-function extractText(body: AdSnapshot['body']): string {
-    if (!body) return '';
-    if (typeof body === 'string') return body;
-    return body?.markup?.__html?.replace(/<[^>]+>/g, '') ?? '';
-}
 
 function processAd(raw: RawAd, sourceURL: string, customData: Record<string, unknown> | null = null): ProcessedAd | null {
     const id = raw.adArchiveID ?? raw.adid ?? raw.ad_archive_id;
     if (!id) return null;
 
-    const snapshot = raw.snapshot ?? {};
+    const snap = raw.snapshot ?? {};
     const images: string[] = [];
     const videos: string[] = [];
+    const videoPreviews: string[] = [];
 
-    // Extract images
-    if (snapshot.images) {
-        for (const img of snapshot.images) {
-            const url = img.original_image_url ?? img.resized_image_url;
-            if (url) images.push(url);
-        }
+    // Extract images from snapshot.images
+    for (const img of snap.images ?? []) {
+        const url = img.original_image_url ?? img.resized_image_url;
+        if (url) images.push(url);
     }
-    // Extract videos
-    if (snapshot.videos) {
-        for (const vid of snapshot.videos) {
-            const url = vid.video_hd_url ?? vid.video_sd_url;
-            if (url) videos.push(url);
-        }
+    // Extract videos from snapshot.videos
+    for (const vid of snap.videos ?? []) {
+        const url = vid.video_hd_url ?? vid.video_sd_url;
+        if (url) videos.push(url);
+        if (vid.video_preview_image_url) videoPreviews.push(vid.video_preview_image_url);
     }
     // Extract from carousel cards
-    if (snapshot.cards) {
-        for (const card of snapshot.cards) {
-            const img = card.original_image_url ?? card.resized_image_url;
-            if (img) images.push(img);
-            const vid = card.video_hd_url ?? card.video_sd_url;
-            if (vid) videos.push(vid);
-        }
+    for (const card of snap.cards ?? []) {
+        const img = card.original_image_url ?? card.resized_image_url;
+        if (img) images.push(img);
+        const vid = card.video_hd_url ?? card.video_sd_url;
+        if (vid) videos.push(vid);
+    }
+    // Extra images/videos
+    for (const img of snap.extra_images ?? []) {
+        const url = img.original_image_url ?? img.resized_image_url;
+        if (url) images.push(url);
+    }
+    for (const vid of snap.extra_videos ?? []) {
+        const url = vid.video_hd_url ?? vid.video_sd_url;
+        if (url) videos.push(url);
     }
 
+    // Body text: snapshot.body can be { text } or { markup.__html } or plain string
     const bodies: string[] = [];
-    const bodyText = extractText(snapshot.body);
-    if (bodyText) bodies.push(bodyText);
+    const snapBody = snap.body;
+    if (snapBody) {
+        if (typeof snapBody === 'string') {
+            if (snapBody) bodies.push(snapBody);
+        } else if (snapBody.text) {
+            bodies.push(snapBody.text);
+        } else if (snapBody.markup?.__html) {
+            bodies.push(snapBody.markup.__html.replace(/<[^>]+>/g, ''));
+        }
+    }
     if (raw.ad_creative_bodies) bodies.push(...raw.ad_creative_bodies);
 
+    // Link titles
     const linkTitles: string[] = [];
-    if (snapshot.title) linkTitles.push(snapshot.title);
+    if (snap.title) linkTitles.push(snap.title);
     if (raw.ad_creative_link_titles) linkTitles.push(...raw.ad_creative_link_titles);
 
+    // Link descriptions
     const linkDescriptions: string[] = [];
-    if (snapshot.link_description) linkDescriptions.push(snapshot.link_description);
+    if (snap.link_description) linkDescriptions.push(snap.link_description);
     if (raw.ad_creative_link_descriptions) linkDescriptions.push(...raw.ad_creative_link_descriptions);
 
+    // Link captions
     const linkCaptions: string[] = [];
-    if (snapshot.link_caption) linkCaptions.push(snapshot.link_caption);
+    if (snap.link_caption) linkCaptions.push(snap.link_caption);
+    if (snap.caption) linkCaptions.push(snap.caption);
 
-    const platforms = raw.publisherPlatform ?? raw.publisher_platforms ?? [];
-    const snapshotUrl = raw.ad_snapshot_url ?? null;
+    // Extra texts
+    const extraTexts: string[] = (snap.extra_texts ?? []).map(e => e.text ?? '').filter(Boolean);
+
+    // Publisher platforms — try all possible field names
+    const platforms: string[] = (
+        raw.publisherPlatform ??
+        raw.publisher_platform ??
+        raw.publisher_platforms ??
+        []
+    );
+
+    // Dates — prefer epoch (startDate/start_date), fall back to formatted strings
+    const startDate = raw.startDate
+        ? epochToISO(raw.startDate)
+        : raw.start_date
+            ? epochToISO(raw.start_date)
+            : (raw.ad_delivery_start_time ?? raw.start_date_formatted ?? null);
+
+    const endDate = raw.endDate != null
+        ? epochToISO(raw.endDate)
+        : raw.end_date != null
+            ? epochToISO(raw.end_date)
+            : (raw.ad_delivery_stop_time ?? raw.end_date_formatted ?? null);
+
+    // Page info — prefer snapshot fields as they tend to be more complete
+    const pageName = snap.page_name ?? raw.pageName ?? raw.page_name ?? null;
+    const pageID = snap.page_id
+        ? String(snap.page_id)
+        : raw.pageID
+            ? String(raw.pageID)
+            : (raw.page_id ?? null);
+    const pageIsDeleted = snap.page_is_deleted ?? raw.pageIsDeleted ?? raw.page_is_deleted ?? false;
+    const pageProfilePictureURL = snap.page_profile_picture_url ?? raw.pageProfilePictureURL ?? null;
+    const pageProfileURI = snap.page_profile_uri ?? null;
+    const pageCategories: string[] = snap.page_categories ?? raw.pageCategories ?? [];
+    const pageLikeCount = snap.page_like_count ?? null;
+
+    const adLibraryURL = raw.ad_library_url ?? (id ? `https://www.facebook.com/ads/library/?id=${id}` : null);
 
     return {
         adArchiveID: String(id),
-        pageName: raw.pageName ?? raw.page_name ?? null,
-        pageID: raw.pageID ? String(raw.pageID) : (raw.page_id ?? null),
+        pageName,
+        pageID,
+        pageProfilePictureURL,
+        pageProfileURI,
+        pageCategories,
+        pageLikeCount,
+        pageIsDeleted,
         entityType: raw.entityType ?? null,
-        startDate: raw.startDate ? epochToISO(raw.startDate) : (raw.ad_delivery_start_time ?? null),
-        endDate: raw.endDate ? epochToISO(raw.endDate) : (raw.ad_delivery_stop_time ?? null),
-        isActive: raw.isActive ?? false,
+        startDate,
+        endDate,
+        isActive: raw.isActive ?? raw.is_active ?? false,
         currency: raw.currency ?? null,
         spend: raw.spend ?? null,
         impressions: raw.impressions ?? null,
+        impressionsWithIndex: raw.impressions_with_index ?? null,
         estimatedAudienceSize: raw.estimated_audience_size ?? null,
-        publisherPlatforms: platforms,
-        snapshot: snapshotUrl,
+        publisherPlatforms: [...new Set(platforms)],
+        adLibraryURL,
         categories: raw.categories ?? [],
-        collationCount: raw.collationCount ?? 0,
+        collationCount: raw.collationCount ?? raw.collation_count ?? null,
+        collationID: raw.collationID ?? raw.collation_id ?? null,
         instagramActorName: raw.instagramActorName ?? null,
-        pageIsDeleted: raw.pageIsDeleted ?? false,
-        pageProfilePictureURL: raw.pageProfilePictureURL ?? null,
-        pageCategories: raw.pageCategories ?? [],
         adCreativeBodies: [...new Set(bodies)],
         adCreativeLinkTitles: [...new Set(linkTitles)],
         adCreativeLinkDescriptions: [...new Set(linkDescriptions)],
         adCreativeLinkCaptions: [...new Set(linkCaptions)],
         adCreativeImages: [...new Set(images)],
         adCreativeVideos: [...new Set(videos)],
+        adCreativeVideoPreviewImages: [...new Set(videoPreviews)],
+        ctaText: snap.cta_text ?? null,
+        ctaType: snap.cta_type ?? null,
+        linkURL: snap.link_url ?? null,
+        displayFormat: snap.display_format ?? null,
+        extraTexts: [...new Set(extraTexts)],
+        extraLinks: [...new Set(snap.extra_links ?? [])],
         demographicDistribution: raw.demographicDistribution ?? [],
         regionDistribution: raw.regionDistribution ?? [],
         scrapedAt: new Date().toISOString(),
