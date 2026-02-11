@@ -238,7 +238,7 @@ function parseAdsFromPageHtml(html: string): RawAd[] {
             // Walk forward to find the matching closing brace
             depth = 0;
             let objEnd = -1;
-            for (let i = objStart; i < Math.min(source.length, objStart + 15000); i++) {
+            for (let i = objStart; i < Math.min(source.length, objStart + 80000); i++) {
                 const ch = source[i];
                 const prev = i > 0 ? source[i - 1] : '';
                 if (escaped && prev === '\\') continue;
@@ -860,14 +860,15 @@ for (const sourceURL of initialURLs) {
             rawAds = parseAdsFromPageHtml(body);
             sourceType = 'HTML';
         } else if (trimmed.includes('ScheduledServerJS') || trimmed.includes('__bbox')) {
-            // Facebook ScheduledServerJS blob — single large JSON, use findAdsInObject directly
+            // Facebook ScheduledServerJS blob — may be JS (not pure JSON), use marker extraction
             sourceType = 'SSR-blob';
             rawAds = [];
             try {
                 const json = JSON.parse(trimmed);
                 rawAds = findAdsInObject(json);
-            } catch {
-                // If direct parse fails, fall back to marker-based extraction
+                crawleeLog.info(`  SSR-blob JSON.parse succeeded, findAdsInObject found ${rawAds.length}`);
+            } catch (parseErr) {
+                crawleeLog.info(`  SSR-blob JSON.parse failed (${(parseErr as Error).message.slice(0, 80)}) — using marker extraction`);
                 rawAds = parseAdsFromPageHtml(body);
             }
         } else {
