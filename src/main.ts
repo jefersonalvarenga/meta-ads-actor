@@ -180,58 +180,122 @@ function parseAdsFromResponseText(text: string): RawAd[] {
 
 /**
  * Extract ad data from the SSR HTML of the Facebook Ad Library page.
- * Facebook embeds the initial data as JSON inside <script> tags in the format:
- *   require("ScheduledServerJS").handle({"__bbox":{"require":[...]}})
- * or as __SSR_DATA__ / requireLazy blobs.
- * We scan all script tag contents for JSON objects containing adArchiveID.
+ *
+ * Facebook embeds ad data in two ways:
+ * A) As real JSON objects in <script> tags (ScheduledServerJS / requireLazy blobs):
+ *      {"adArchiveID":"123",...}   → marker = '"adArchiveID"'
+ * B) As JSON-encoded strings inside larger JSON (the inner JSON is escaped):
+ *      {\"adArchiveID\":\"123\",...}  → marker = '\\"adArchiveID\\"'
+ *    This happens when FB serialises inner data as a string value, e.g.:
+ *      "data": "{\"adArchiveID\":\"123\"}"
+ *
+ * Both forms are handled by scanning for the marker and extracting + parsing
+ * the surrounding JSON object.
  */
 function parseAdsFromPageHtml(html: string): RawAd[] {
     const ads: RawAd[] = [];
-    const seen = new Set<string>();
+    const seenCandidates = new Set<string>();
+    const seenIds = new Set<string>();
 
-    // Extract all JSON-like blobs from script tags and inline data attributes.
-    // Strategy: find all occurrences of "adArchiveID" and walk outward to find
-    // the containing JSON object boundary.
-    const marker = '"adArchiveID"';
-    let searchFrom = 0;
-    while (true) {
-        const markerPos = html.indexOf(marker, searchFrom);
-        if (markerPos === -1) break;
-        searchFrom = markerPos + marker.length;
+    function extractFromMarker(source: string, marker: string, escaped: boolean): void {
+        let searchFrom = 0;
+        while (true) {
+            const markerPos = source.indexOf(marker, searchFrom);
+            if (markerPos === -1) break;
+            searchFrom = markerPos + marker.length;
 
-        // Walk backward to find the nearest { that starts an object containing this key
-        let depth = 0;
-        let objStart = -1;
-        for (let i = markerPos; i >= Math.max(0, markerPos - 5000); i--) {
-            if (html[i] === '}') depth++;
-            else if (html[i] === '{') {
-                if (depth === 0) { objStart = i; break; }
-                depth--;
+            // Walk backward to find the nearest unescaped { brace
+            let depth = 0;
+            let objStart = -1;
+            for (let i = markerPos; i >= Math.max(0, markerPos - 8000); i--) {
+                const ch = source[i];
+                const prev = i > 0 ? source[i - 1] : '';
+                if (escaped && prev === '\\') continue; // skip escaped braces
+                if (ch === '}') depth++;
+                else if (ch === '{') {
+                    if (depth === 0) { objStart = i; break; }
+                    depth--;
+                }
+            }
+            if (objStart === -1) continue;
+
+            // Walk forward to find the matching closing brace
+            depth = 0;
+            let objEnd = -1;
+            for (let i = objStart; i < Math.min(source.length, objStart + 15000); i++) {
+                const ch = source[i];
+                const prev = i > 0 ? source[i - 1] : '';
+                if (escaped && prev === '\\') continue;
+                if (ch === '{') depth++;
+                else if (ch === '}') {
+                    depth--;
+                    if (depth === 0) { objEnd = i; break; }
+                }
+            }
+            if (objEnd === -1) continue;
+
+            let candidate = source.slice(objStart, objEnd + 1);
+            if (seenCandidates.has(candidate)) continue;
+            seenCandidates.add(candidate);
+
+            // If escaped form, unescape before parsing
+            if (escaped) {
+                try { candidate = JSON.parse(`"${candidate.replace(/^"|"$/g, '')}"`); } catch { /* try direct */ }
+            }
+
+            let json: unknown;
+            try { json = JSON.parse(candidate); } catch { continue; }
+            const found = findAdsInObject(json);
+            for (const ad of found) {
+                const id = ad.adArchiveID ?? ad.adid ?? ad.ad_archive_id;
+                if (!id || seenIds.has(String(id))) continue;
+                seenIds.add(String(id));
+                ads.push(ad);
             }
         }
-        if (objStart === -1) continue;
-
-        // Walk forward to find the matching closing }
-        depth = 0;
-        let objEnd = -1;
-        for (let i = objStart; i < Math.min(html.length, objStart + 10000); i++) {
-            if (html[i] === '{') depth++;
-            else if (html[i] === '}') {
-                depth--;
-                if (depth === 0) { objEnd = i; break; }
-            }
-        }
-        if (objEnd === -1) continue;
-
-        const candidate = html.slice(objStart, objEnd + 1);
-        if (seen.has(candidate)) continue;
-        seen.add(candidate);
-
-        let json: unknown;
-        try { json = JSON.parse(candidate); } catch { continue; }
-        const found = findAdsInObject(json);
-        ads.push(...found);
     }
+
+    // Pass A: direct JSON objects — "adArchiveID":"..."
+    extractFromMarker(html, '"adArchiveID"', false);
+
+    // Pass B: escaped JSON strings — \"adArchiveID\":\"...\"
+    // Only run if pass A found nothing (FB sometimes serialises inner data as escaped strings)
+    if (ads.length === 0) {
+        extractFromMarker(html, '\\"adArchiveID\\"', true);
+    }
+
+    // Pass C: parse each <script> tag as JSON directly (handles ScheduledServerJS blobs)
+    if (ads.length === 0) {
+        const scriptRe = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+        let m: RegExpExecArray | null;
+        while ((m = scriptRe.exec(html)) !== null) {
+            const content = m[1].trim();
+            if (!content.includes('adArchiveID')) continue;
+            // Try to find JSON.parse-able chunks by looking for top-level {...}
+            const jsonStart = content.indexOf('{');
+            if (jsonStart === -1) continue;
+            let depth = 0;
+            let end = -1;
+            for (let i = jsonStart; i < content.length; i++) {
+                if (content[i] === '{') depth++;
+                else if (content[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+            }
+            if (end === -1) continue;
+            const candidate = content.slice(jsonStart, end + 1);
+            if (seenCandidates.has(candidate)) continue;
+            seenCandidates.add(candidate);
+            let json: unknown;
+            try { json = JSON.parse(candidate); } catch { continue; }
+            const found = findAdsInObject(json);
+            for (const ad of found) {
+                const id = ad.adArchiveID ?? ad.adid ?? ad.ad_archive_id;
+                if (!id || seenIds.has(String(id))) continue;
+                seenIds.add(String(id));
+                ads.push(ad);
+            }
+        }
+    }
+
     return ads;
 }
 
@@ -476,11 +540,18 @@ async function fetchFbTokensViaBrowser(
             const html = await page.content();
             log.info(`Browser page size: ${html.length} chars`);
 
-            // Add the full page HTML as a "response body" — parseAdsFromResponseText
-            // already handles both newline-delimited JSON and embedded script JSON.
+            // Add the full page HTML as a "response body" — parseAdsFromPageHtml
+            // will handle extraction of SSR-embedded ad data.
             if (html.includes('adArchiveID') || html.includes('ad_archive_id')) {
                 log.info('Found ad data embedded in page HTML — adding to captured bodies');
                 capturedBodies.push(html);
+
+                // Save a debug snippet: 500 chars around the first "adArchiveID" occurrence
+                const markerIdx = html.indexOf('"adArchiveID"');
+                if (markerIdx !== -1) {
+                    const snippet = html.slice(Math.max(0, markerIdx - 200), markerIdx + 300);
+                    log.info(`adArchiveID context snippet: ${snippet.replace(/\n/g, ' ').slice(0, 400)}`);
+                }
             }
 
             // Scroll to trigger lazy-loaded batches (async/search_ads calls for pages 2+).
