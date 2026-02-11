@@ -24,126 +24,36 @@ interface Input {
     customData?: Record<string, unknown>;
 }
 
-interface SpendRange {
-    lower_bound?: string | number;
-    upper_bound?: string | number;
-}
-
-interface DemographicEntry {
-    age?: string;
-    gender?: string;
-    percentage?: string | number;
-}
-
-interface RegionEntry {
-    region?: string;
-    percentage?: string | number;
-}
-
 interface AdSnapshot {
-    body?: { text?: string; markup?: { __html?: string } } | string;
-    title?: string;
-    link_url?: string;
-    link_description?: string;
-    link_caption?: string;
-    caption?: string;
     cta_type?: string;
-    cta_text?: string;
-    display_format?: string;
+    link_url?: string;
     page_name?: string;
     page_id?: string;
-    page_is_deleted?: boolean;
-    page_profile_picture_url?: string;
     page_profile_uri?: string;
     page_like_count?: number;
     page_categories?: string[];
-    images?: Array<{
-        original_image_url?: string;
-        resized_image_url?: string;
-        watermarked_resized_image_url?: string;
-    }>;
-    videos?: Array<{
-        video_hd_url?: string;
-        video_sd_url?: string;
-        video_preview_image_url?: string;
-        watermarked_video_hd_url?: string;
-        watermarked_video_sd_url?: string;
-    }>;
-    cards?: Array<{
-        body?: string;
-        title?: string;
-        link_url?: string;
-        caption?: string;
-        resized_image_url?: string;
-        original_image_url?: string;
-        video_hd_url?: string;
-        video_sd_url?: string;
-    }>;
-    extra_images?: Array<{ original_image_url?: string; resized_image_url?: string }>;
-    extra_videos?: Array<{ video_hd_url?: string; video_sd_url?: string }>;
-    extra_texts?: Array<{ text?: string }>;
-    extra_links?: string[];
-}
-
-interface ImpressionsWithIndex {
-    impressions_text?: string | null;
-    impressions_index?: number;
 }
 
 interface RawAd {
     adid?: string;
     adArchiveID?: string;
-    archiveTypes?: string[];
-    categories?: Array<number | string>;
-    collationCount?: number;
-    collationID?: string;
-    currency?: string;
-    endDate?: number | null;
-    entityType?: string;
-    instagramActorName?: string | null;
-    isActive?: boolean;
-    isProfilePage?: boolean;
     pageID?: string;
     pageName?: string;
-    pageIsDeleted?: boolean;
-    pageProfilePictureURL?: string;
     pageCategories?: string[];
     publisherPlatform?: string[];
     snapshot?: AdSnapshot;
     startDate?: number;
-    spend?: SpendRange;
-    impressions?: SpendRange;
-    demographicDistribution?: DemographicEntry[];
-    regionDistribution?: RegionEntry[];
-    // snake_case fields
+    endDate?: number | null;
+    // snake_case variants
     ad_archive_id?: string;
     page_id?: string;
     page_name?: string;
-    page_is_deleted?: boolean;
-    ad_delivery_start_time?: string;
-    ad_delivery_stop_time?: string | null;
-    ad_snapshot_url?: string;
-    ad_creative_bodies?: string[];
-    ad_creative_link_titles?: string[];
-    ad_creative_link_descriptions?: string[];
     publisher_platforms?: string[];
     publisher_platform?: string[];
-    estimated_audience_size?: SpendRange;
-    is_active?: boolean;
+    ad_delivery_start_time?: string;
+    ad_delivery_stop_time?: string | null;
     start_date?: number;
     end_date?: number | null;
-    collation_count?: number;
-    collation_id?: string;
-    impressions_with_index?: ImpressionsWithIndex;
-    gated_type?: string;
-    contains_digital_created_media?: boolean;
-    contains_sensitive_content?: boolean;
-    total_active_time?: number | null;
-    ad_library_url?: string;
-    url?: string;
-    total?: number;
-    position?: number;
-    ads_count?: number;
     start_date_formatted?: string;
     end_date_formatted?: string;
 }
@@ -152,43 +62,15 @@ interface ProcessedAd {
     adArchiveID: string;
     pageName: string | null;
     pageID: string | null;
-    pageProfilePictureURL: string | null;
     pageProfileURI: string | null;
     pageCategories: string[];
     pageLikeCount: number | null;
-    pageIsDeleted: boolean;
-    entityType: string | null;
+    publisherPlatforms: string[];
     startDate: string | null;
     endDate: string | null;
-    isActive: boolean;
-    currency: string | null;
-    spend: SpendRange | null;
-    impressions: SpendRange | null;
-    impressionsWithIndex: ImpressionsWithIndex | null;
-    estimatedAudienceSize: SpendRange | null;
-    publisherPlatforms: string[];
-    adLibraryURL: string | null;
-    categories: Array<number | string>;
-    collationCount: number | null;
-    collationID: string | null;
-    instagramActorName: string | null;
-    adCreativeBodies: string[];
-    adCreativeLinkTitles: string[];
-    adCreativeLinkDescriptions: string[];
-    adCreativeLinkCaptions: string[];
-    adCreativeImages: string[];
-    adCreativeVideos: string[];
-    adCreativeVideoPreviewImages: string[];
-    ctaText: string | null;
     ctaType: string | null;
     linkURL: string | null;
-    displayFormat: string | null;
-    extraTexts: string[];
-    extraLinks: string[];
-    demographicDistribution: DemographicEntry[];
-    regionDistribution: RegionEntry[];
     scrapedAt: string;
-    sourceURL: string;
     customData: Record<string, unknown> | null;
 }
 
@@ -217,65 +99,11 @@ function epochToISO(epoch: number | null | undefined): string | null {
     return new Date(epoch * 1000).toISOString();
 }
 
-function processAd(raw: RawAd, sourceURL: string, customData: Record<string, unknown> | null = null): ProcessedAd | null {
+function processAd(raw: RawAd, customData: Record<string, unknown> | null = null): ProcessedAd | null {
     const id = raw.adArchiveID ?? raw.adid ?? raw.ad_archive_id;
     if (!id) return null;
 
     const snap = raw.snapshot ?? {};
-    const images: string[] = [];
-    const videos: string[] = [];
-    const videoPreviews: string[] = [];
-
-    for (const img of snap.images ?? []) {
-        const url = img.original_image_url ?? img.resized_image_url;
-        if (url) images.push(url);
-    }
-    for (const vid of snap.videos ?? []) {
-        const url = vid.video_hd_url ?? vid.video_sd_url;
-        if (url) videos.push(url);
-        if (vid.video_preview_image_url) videoPreviews.push(vid.video_preview_image_url);
-    }
-    for (const card of snap.cards ?? []) {
-        const img = card.original_image_url ?? card.resized_image_url;
-        if (img) images.push(img);
-        const vid = card.video_hd_url ?? card.video_sd_url;
-        if (vid) videos.push(vid);
-    }
-    for (const img of snap.extra_images ?? []) {
-        const url = img.original_image_url ?? img.resized_image_url;
-        if (url) images.push(url);
-    }
-    for (const vid of snap.extra_videos ?? []) {
-        const url = vid.video_hd_url ?? vid.video_sd_url;
-        if (url) videos.push(url);
-    }
-
-    const bodies: string[] = [];
-    const snapBody = snap.body;
-    if (snapBody) {
-        if (typeof snapBody === 'string') {
-            if (snapBody) bodies.push(snapBody);
-        } else if (snapBody.text) {
-            bodies.push(snapBody.text);
-        } else if (snapBody.markup?.__html) {
-            bodies.push(snapBody.markup.__html.replace(/<[^>]+>/g, ''));
-        }
-    }
-    if (raw.ad_creative_bodies) bodies.push(...raw.ad_creative_bodies);
-
-    const linkTitles: string[] = [];
-    if (snap.title) linkTitles.push(snap.title);
-    if (raw.ad_creative_link_titles) linkTitles.push(...raw.ad_creative_link_titles);
-
-    const linkDescriptions: string[] = [];
-    if (snap.link_description) linkDescriptions.push(snap.link_description);
-    if (raw.ad_creative_link_descriptions) linkDescriptions.push(...raw.ad_creative_link_descriptions);
-
-    const linkCaptions: string[] = [];
-    if (snap.link_caption) linkCaptions.push(snap.link_caption);
-    if (snap.caption) linkCaptions.push(snap.caption);
-
-    const extraTexts: string[] = (snap.extra_texts ?? []).map(e => e.text ?? '').filter(Boolean);
 
     const platforms: string[] = (
         raw.publisherPlatform ??
@@ -296,60 +124,19 @@ function processAd(raw: RawAd, sourceURL: string, customData: Record<string, unk
             ? epochToISO(raw.end_date)
             : (raw.ad_delivery_stop_time ?? raw.end_date_formatted ?? null);
 
-    const pageName = snap.page_name ?? raw.pageName ?? raw.page_name ?? null;
-    const pageID = snap.page_id
-        ? String(snap.page_id)
-        : raw.pageID
-            ? String(raw.pageID)
-            : (raw.page_id ?? null);
-    const pageIsDeleted = snap.page_is_deleted ?? raw.pageIsDeleted ?? raw.page_is_deleted ?? false;
-    const pageProfilePictureURL = snap.page_profile_picture_url ?? raw.pageProfilePictureURL ?? null;
-    const pageProfileURI = snap.page_profile_uri ?? null;
-    const pageCategories: string[] = snap.page_categories ?? raw.pageCategories ?? [];
-    const pageLikeCount = snap.page_like_count ?? null;
-    const adLibraryURL = raw.ad_library_url ?? (id ? `https://www.facebook.com/ads/library/?id=${id}` : null);
-
     return {
         adArchiveID: String(id),
-        pageName,
-        pageID,
-        pageProfilePictureURL,
-        pageProfileURI,
-        pageCategories,
-        pageLikeCount,
-        pageIsDeleted,
-        entityType: raw.entityType ?? null,
+        pageName: snap.page_name ?? raw.pageName ?? raw.page_name ?? null,
+        pageID: snap.page_id ? String(snap.page_id) : raw.pageID ? String(raw.pageID) : (raw.page_id ?? null),
+        pageProfileURI: snap.page_profile_uri ?? null,
+        pageCategories: snap.page_categories ?? raw.pageCategories ?? [],
+        pageLikeCount: snap.page_like_count ?? null,
+        publisherPlatforms: [...new Set(platforms)],
         startDate,
         endDate,
-        isActive: raw.isActive ?? raw.is_active ?? false,
-        currency: raw.currency ?? null,
-        spend: raw.spend ?? null,
-        impressions: raw.impressions ?? null,
-        impressionsWithIndex: raw.impressions_with_index ?? null,
-        estimatedAudienceSize: raw.estimated_audience_size ?? null,
-        publisherPlatforms: [...new Set(platforms)],
-        adLibraryURL,
-        categories: raw.categories ?? [],
-        collationCount: raw.collationCount ?? raw.collation_count ?? null,
-        collationID: raw.collationID ?? raw.collation_id ?? null,
-        instagramActorName: raw.instagramActorName ?? null,
-        adCreativeBodies: [...new Set(bodies)],
-        adCreativeLinkTitles: [...new Set(linkTitles)],
-        adCreativeLinkDescriptions: [...new Set(linkDescriptions)],
-        adCreativeLinkCaptions: [...new Set(linkCaptions)],
-        adCreativeImages: [...new Set(images)],
-        adCreativeVideos: [...new Set(videos)],
-        adCreativeVideoPreviewImages: [...new Set(videoPreviews)],
-        ctaText: snap.cta_text ?? null,
         ctaType: snap.cta_type ?? null,
         linkURL: snap.link_url ?? null,
-        displayFormat: snap.display_format ?? null,
-        extraTexts: [...new Set(extraTexts)],
-        extraLinks: [...new Set(snap.extra_links ?? [])],
-        demographicDistribution: raw.demographicDistribution ?? [],
-        regionDistribution: raw.regionDistribution ?? [],
         scrapedAt: new Date().toISOString(),
-        sourceURL,
         customData,
     };
 }
@@ -783,7 +570,7 @@ for (const sourceURL of initialURLs) {
         crawleeLog.info(`  → ${rawAds.length} ads found in captured response`);
         for (const raw of rawAds) {
             if (maxItems > 0 && ads.length >= maxItems) break;
-            const processed = processAd(raw, sourceURL, customData);
+            const processed = processAd(raw, customData);
             if (!processed) continue;
             if (seenIds.has(processed.adArchiveID)) continue;
             seenIds.add(processed.adArchiveID);
