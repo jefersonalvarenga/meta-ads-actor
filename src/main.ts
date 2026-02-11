@@ -398,6 +398,8 @@ interface FbTokens {
     lsd: string;
     /** The exact proxy URL used by the browser — HTTP calls must use this same IP */
     proxyUrl: string | undefined;
+    /** Captured async search response bodies from the browser's own network traffic */
+    capturedSearchResponses: string[];
 }
 
 function cookieMapToHeader(map: Record<string, string>): string {
@@ -440,7 +442,7 @@ async function fetchFbTokensViaBrowser(
     const pinnedProxyUrl = await proxyConfiguration?.newUrl('warmup_session') ?? undefined;
     crawleeLog.info(`Pinned proxy URL for this session: ${pinnedProxyUrl ? 'set' : 'none'}`);
 
-    let result: FbTokens = { cookies: '', dtsg: '', lsd: '', proxyUrl: pinnedProxyUrl };
+    let result: FbTokens = { cookies: '', dtsg: '', lsd: '', proxyUrl: pinnedProxyUrl, capturedSearchResponses: [] };
 
     // Create a proxy configuration that always returns the same pinned URL
     const pinnedProxyConfig = pinnedProxyUrl
@@ -502,10 +504,27 @@ async function fetchFbTokensViaBrowser(
                         await route.continue();
                     }
                 });
+
+                // Capture the async search_ads responses that the page makes naturally
+                // while loading — these are perfectly valid AJAX responses with ad data.
+                const capturedBodies: string[] = [];
+                page.on('response', async (resp) => {
+                    const url = resp.url();
+                    if (!url.includes('async/search_ads') && !url.includes('api/graphql')) return;
+                    if (resp.status() < 200 || resp.status() >= 300) return;
+                    try {
+                        const text = await resp.text();
+                        if (text.includes('adArchiveID') || text.includes('ad_archive_id')) {
+                            crawleeLog.info(`Captured search response: ${text.length} chars from ${url.slice(0, 80)}`);
+                            capturedBodies.push(text);
+                        }
+                    } catch { /* ignore */ }
+                });
+                request.userData['capturedBodies'] = capturedBodies;
             },
         ],
 
-        async requestHandler({ page, log }) {
+        async requestHandler({ page, log, request }) {
             log.info('Browser warmup: page loaded, waiting for challenge resolution...');
 
             // The __rd_verify challenge JS runs automatically:
@@ -521,6 +540,17 @@ async function fetchFbTokensViaBrowser(
                 if (!html.includes('__rd_verify')) break; // challenge resolved
                 log.info(`Challenge still present after wait ${i + 1}, continuing...`);
             }
+
+            // Scroll to trigger lazy-load of ads (browser's own async/search_ads AJAX calls)
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+            await page.waitForTimeout(1500);
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            // Wait for the AJAX requests triggered by scroll to complete
+            try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch { /* ok */ }
+            await page.waitForTimeout(1000);
+
+            const capturedBodies: string[] = (request.userData['capturedBodies'] as string[]) ?? [];
+            log.info(`Captured ${capturedBodies.length} search response(s) from browser network`);
 
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
@@ -546,7 +576,6 @@ async function fetchFbTokensViaBrowser(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                     const bbox = (window as any).__bbox;
                     if (!bbox) return '';
-                    // Walk bbox looking for dtsg token
                     function find(obj: unknown, depth: number): string {
                         if (depth > 6 || !obj || typeof obj !== 'object') return '';
                         const r = obj as Record<string, unknown>;
@@ -562,7 +591,7 @@ async function fetchFbTokensViaBrowser(
             if (!dtsg) dtsg = dtsgHtml;
             log.info(`Tokens — dtsg: ${dtsg ? 'OK (' + dtsg.slice(0, 8) + '...)' : 'MISSING'}, lsd: ${lsd ? 'OK (' + lsd + ')' : 'MISSING'}`);
 
-            result = { cookies: cookieHeader, dtsg, lsd, proxyUrl: pinnedProxyUrl };
+            result = { cookies: cookieHeader, dtsg, lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
         },
 
         failedRequestHandler({ log }, error) {
@@ -591,6 +620,7 @@ async function scrapeViaAsyncAPI(
     endPage: number,
     sourceURL: string,
     customData: Record<string, unknown> | null,
+    startOffset = 0,
 ): Promise<ProcessedAd[]> {
     const results: ProcessedAd[] = [];
     const seenIds = new Set<string>();
@@ -598,7 +628,7 @@ async function scrapeViaAsyncAPI(
     const adTypeValue = AD_TYPE_MAP[(searchParams.adType ?? 'ALL').toUpperCase()] ?? 'all';
     const activeStatusValue = ACTIVE_STATUS_MAP[(searchParams.activeStatus ?? 'ALL').toUpperCase()] ?? 'all';
 
-    let offset = 0;
+    let offset = startOffset;
     const pageSize = 30;
     let pageNum = 0;
 
@@ -837,22 +867,60 @@ for (const sourceURL of initialURLs) {
         continue;
     }
 
-    // Step 2: Call async API with pagination (pure HTTP, no browser)
+    // Step 2a: Process ads already captured from the browser's own network traffic.
+    // These are perfectly valid responses — the browser made the async/search_ads
+    // calls naturally while loading the page.
+    const ads: ProcessedAd[] = [];
+    const seenIds = new Set<string>();
+
+    crawleeLog.info(`Processing ${tokens.capturedSearchResponses.length} captured browser response(s)...`);
+    for (const body of tokens.capturedSearchResponses) {
+        const rawAds = parseAdsFromResponseText(body);
+        crawleeLog.info(`  → ${rawAds.length} ads found in captured response`);
+        for (const raw of rawAds) {
+            if (maxItems > 0 && ads.length >= maxItems) break;
+            const processed = processAd(raw, sourceURL, customData);
+            if (!processed) continue;
+            if (seenIds.has(processed.adArchiveID)) continue;
+            seenIds.add(processed.adArchiveID);
+            ads.push(processed);
+        }
+    }
+
+    crawleeLog.info(`Got ${ads.length} ads from browser-captured responses for URL: ${sourceURL}`);
+
+    // Step 2b: If we still need more ads (or captured nothing), call the async API
+    // with pagination (pure HTTP, no browser).
     // IMPORTANT: use tokens.proxyUrl — the exact same IP the browser used,
     // because rd_challenge cookies are bound to that IP.
-    const remaining = maxItems > 0 ? maxItems - totalScraped : 0;
-    crawleeLog.info(`Using pinned proxy for HTTP calls: ${tokens.proxyUrl ? 'set' : 'none'}`);
-    const ads = await scrapeViaAsyncAPI(
-        searchParams,
-        tokens,
-        tokens.proxyUrl,
-        remaining,
-        endPage,
-        sourceURL,
-        customData,
-    );
+    const remaining = maxItems > 0 ? maxItems - totalScraped - ads.length : 0;
+    const needMoreAds = (maxItems === 0 || ads.length < maxItems) && tokens.lsd;
 
-    crawleeLog.info(`Got ${ads.length} ads from async API for URL: ${sourceURL}`);
+    if (needMoreAds) {
+        crawleeLog.info(`Using pinned proxy for HTTP calls: ${tokens.proxyUrl ? 'set' : 'none'}`);
+        // Calculate how many pages to skip (browser already loaded the first batch)
+        const firstPageOffset = ads.length > 0 ? ads.length : 0;
+        const httpAds = await scrapeViaAsyncAPI(
+            searchParams,
+            tokens,
+            tokens.proxyUrl,
+            remaining,
+            endPage,
+            sourceURL,
+            customData,
+            firstPageOffset,
+        );
+        crawleeLog.info(`Got ${httpAds.length} additional ads from async HTTP API for URL: ${sourceURL}`);
+        for (const ad of httpAds) {
+            if (seenIds.has(ad.adArchiveID)) continue;
+            seenIds.add(ad.adArchiveID);
+            ads.push(ad);
+        }
+    } else if (!tokens.lsd) {
+        crawleeLog.warning('lsd token missing — skipping HTTP pagination (browser-captured ads only)');
+    }
+
+    crawleeLog.info(`Total ads for URL: ${ads.length}`);
 
     // Step 3: Push to dataset
     for (const ad of ads) {
