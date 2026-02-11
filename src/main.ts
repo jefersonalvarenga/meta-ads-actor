@@ -438,9 +438,12 @@ async function fetchFbTokensViaBrowser(
     const warmupCrawler = new PlaywrightCrawler({
         proxyConfiguration,
         maxRequestsPerCrawl: 1,
-        requestHandlerTimeoutSecs: 60,
-        navigationTimeoutSecs: 45,
-        maxSessionRotations: 3,
+        requestHandlerTimeoutSecs: 90,
+        navigationTimeoutSecs: 60,
+        maxSessionRotations: 5,
+        // Disable crawlee's built-in block detection — Facebook returns 403 for
+        // the challenge page but we need the browser to load and execute the JS.
+        sessionPoolOptions: { maxPoolSize: 10 },
 
         launchContext: {
             launchOptions: {
@@ -467,34 +470,52 @@ async function fetchFbTokensViaBrowser(
         },
 
         preNavigationHooks: [
-            async ({ page }) => {
+            async ({ page, request }) => {
                 await page.addInitScript(() => {
                     Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                });
+                // Intercept the Ad Library page: if Facebook returns 403 with the
+                // __rd_verify challenge, re-fulfill as 200 so crawlee does NOT abort.
+                // The browser will still execute the inline JS (fetch + reload).
+                await page.route('**/ads/library/**', async (route) => {
+                    const response = await route.fetch();
+                    if (response.status() === 403) {
+                        crawleeLog.info(`Intercepted 403 on ${request.url} — re-fulfilling as 200 for JS challenge execution`);
+                        await route.fulfill({
+                            status: 200,
+                            headers: Object.fromEntries(Object.entries(response.headers())),
+                            body: await response.body(),
+                        });
+                    } else {
+                        await route.continue();
+                    }
                 });
             },
         ],
 
         async requestHandler({ page, log }) {
-            log.info('Browser warmup: waiting for Ad Library to load...');
+            log.info('Browser warmup: page loaded, waiting for challenge resolution...');
 
-            // Wait for page to settle — the __rd_verify JS will run automatically
-            // in the browser context and reload the page
-            try {
-                await page.waitForLoadState('networkidle', { timeout: 30000 });
-            } catch {
-                // Even if timeout, try to extract what we have
+            // The __rd_verify challenge JS runs automatically:
+            //   fetch('/__rd_verify_...', { method: 'POST' }).finally(() => window.location.reload())
+            // We wait for the reload to complete after the challenge POST.
+            // Strategy: wait for networkidle twice — once for initial load, once after reload.
+            for (let i = 0; i < 2; i++) {
+                try {
+                    await page.waitForLoadState('networkidle', { timeout: 20000 });
+                } catch { /* continue */ }
+                await page.waitForTimeout(2000);
+                const html = await page.content();
+                if (!html.includes('__rd_verify')) break; // challenge resolved
+                log.info(`Challenge still present after wait ${i + 1}, continuing...`);
             }
 
-            // Extra wait for any challenge redirect to complete
-            await page.waitForTimeout(3000);
-
-            // Get final URL and HTML after any redirects/challenges
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
 
             const html = await page.content();
             log.info(`Browser page size: ${html.length} chars`);
-            log.info(`HTML preview: ${html.slice(0, 300).replace(/\n/g, ' ')}`);
+            log.info(`HTML preview: ${html.slice(0, 400).replace(/\n/g, ' ')}`);
 
             // Extract cookies from browser context
             const browserCookies = await page.context().cookies();
@@ -503,9 +524,8 @@ async function fetchFbTokensViaBrowser(
                 cookieMap[c.name] = c.value;
             }
             const cookieHeader = cookieMapToHeader(cookieMap);
-            log.info(`Browser cookies collected: ${Object.keys(cookieMap).join(', ')}`);
+            log.info(`Browser cookies: ${Object.keys(cookieMap).join(', ')}`);
 
-            // Extract tokens
             const { dtsg, lsd } = extractTokensFromHtml(html);
             log.info(`Tokens — dtsg: ${dtsg ? 'OK' : 'MISSING'}, lsd: ${lsd ? 'OK' : 'MISSING'}`);
 
