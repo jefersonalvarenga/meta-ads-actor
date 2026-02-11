@@ -143,7 +143,23 @@ function processAd(raw: RawAd, customData: Record<string, unknown> | null = null
 }
 
 function findAdsInObject(obj: unknown, depth = 0): RawAd[] {
-    if (depth > 15 || obj === null || typeof obj !== 'object') return [];
+    if (depth > 20) return [];
+    if (obj === null) return [];
+
+    // If it's a string, check if it looks like a JSON array/object containing ad data
+    if (typeof obj === 'string') {
+        const trimmed = obj.trimStart();
+        if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && trimmed.includes('adArchiveID')) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                return findAdsInObject(parsed, depth + 1);
+            } catch { /* not valid JSON */ }
+        }
+        return [];
+    }
+
+    if (typeof obj !== 'object') return [];
+
     const results: RawAd[] = [];
     if (Array.isArray(obj)) {
         for (const item of obj) results.push(...findAdsInObject(item, depth + 1));
