@@ -241,12 +241,10 @@ async function fetchFbTokensViaBrowser(
     const warmupCrawler = new PlaywrightCrawler({
         proxyConfiguration: pinnedProxyConfig,
         maxRequestsPerCrawl: 1,
-        requestHandlerTimeoutSecs: 90,
+        requestHandlerTimeoutSecs: 120,
         navigationTimeoutSecs: 60,
-        maxSessionRotations: 5,
-        // Disable crawlee's built-in block detection — Facebook returns 403 for
-        // the challenge page but we need the browser to load and execute the JS.
-        sessionPoolOptions: { maxPoolSize: 10 },
+        maxSessionRotations: 0,   // don't rotate — we pinned a proxy IP
+        sessionPoolOptions: { maxPoolSize: 1 },
 
         launchContext: {
             launchOptions: {
@@ -302,20 +300,14 @@ async function fetchFbTokensViaBrowser(
                     await route.continue();
                 });
 
-                // Intercept the Ad Library page: if Facebook returns 403 with the
-                // __rd_verify challenge, re-fulfill as 200 so crawlee does NOT abort.
-                // The browser will still execute the inline JS (fetch + reload).
-                await page.route('**/ads/library/**', async (route) => {
-                    const response = await route.fetch();
-                    if (response.status() === 403) {
-                        crawleeLog.info(`Intercepted 403 on ${request.url} — re-fulfilling as 200 for JS challenge execution`);
-                        await route.fulfill({
-                            status: 200,
-                            headers: Object.fromEntries(Object.entries(response.headers())),
-                            body: await response.body(),
-                        });
-                    } else {
-                        await route.continue();
+                // Monitor the Ad Library page response status — just log, don't block.
+                // We handle 403 (__rd_verify challenge) by waiting for the JS to reload the page.
+                // Using route.fetch() caused deadlocks (second HTTP request times out while
+                // the browser is still waiting for the original response).
+                page.on('response', (resp) => {
+                    const url = resp.url();
+                    if (url.includes('/ads/library') && !url.includes('async') && !url.includes('graphql')) {
+                        crawleeLog.info(`Ad Library page response: ${resp.status()} for ${url.slice(0, 80)}`);
                     }
                 });
 
@@ -447,6 +439,13 @@ async function fetchFbTokensViaBrowser(
             log.info(`lsd: ${lsd ? 'OK' : 'MISSING'}`);
 
             result = { cookies: cookieHeader, dtsg: '', lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
+        },
+
+        // Facebook returns 403 for the __rd_verify challenge page — don't treat as failure.
+        // The browser still executes the inline JS which solves the challenge and reloads.
+        errorHandler({ request, log }, error) {
+            log.warning(`Request error (may be 403 challenge — continuing): ${error.message}`);
+            request.noRetry = true; // don't retry — let the requestHandler handle it
         },
 
         failedRequestHandler({ log }, error) {
