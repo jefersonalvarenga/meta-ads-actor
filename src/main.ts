@@ -546,11 +546,15 @@ async function fetchFbTokensViaBrowser(
                 log.info('Found ad data embedded in page HTML — adding to captured bodies');
                 capturedBodies.push(html);
 
-                // Save a debug snippet: 500 chars around the first "adArchiveID" occurrence
-                const markerIdx = html.indexOf('"adArchiveID"');
-                if (markerIdx !== -1) {
-                    const snippet = html.slice(Math.max(0, markerIdx - 200), markerIdx + 300);
-                    log.info(`adArchiveID context snippet: ${snippet.replace(/\n/g, ' ').slice(0, 400)}`);
+                // Save a debug snippet: 500 chars around the first adArchiveID occurrence
+                // Check multiple forms to understand the encoding
+                for (const marker of ['"adArchiveID"', '\\"adArchiveID\\"', 'adArchiveID']) {
+                    const markerIdx = html.indexOf(marker);
+                    if (markerIdx !== -1) {
+                        const snippet = html.slice(Math.max(0, markerIdx - 100), markerIdx + 200);
+                        log.info(`adArchiveID [${marker}] snippet: ${JSON.stringify(snippet).slice(0, 400)}`);
+                        break;
+                    }
                 }
             }
 
