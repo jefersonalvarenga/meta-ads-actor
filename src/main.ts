@@ -1,5 +1,5 @@
 import { Actor } from 'apify';
-import { log as crawleeLog, gotScraping, PlaywrightCrawler } from 'crawlee';
+import { log as crawleeLog, PlaywrightCrawler } from 'crawlee';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -195,7 +195,7 @@ interface ProcessedAd {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const AD_LIBRARY_BASE = 'https://www.facebook.com/ads/library/';
-const ASYNC_SEARCH_URL = 'https://www.facebook.com/ads/library/async/search_ads/';
+
 
 const AD_TYPE_MAP: Record<string, string> = {
     'ALL': 'all',
@@ -436,6 +436,7 @@ function extractTokensFromHtml(html: string): { dtsg: string; lsd: string } {
 async function fetchFbTokensViaBrowser(
     searchUrl: string,
     proxyConfiguration: import('apify').ProxyConfiguration | undefined,
+    maxItems: number,
 ): Promise<FbTokens> {
     // Pin a single proxy URL so that both the browser warmup AND the subsequent
     // HTTP calls hit the exact same IP — the rd_challenge cookie is IP-bound.
@@ -489,30 +490,24 @@ async function fetchFbTokensViaBrowser(
                     Object.defineProperty(navigator, 'webdriver', { get: () => false });
                 });
 
-                // Block heavy resources that aren't needed for scraping.
-                // This reduces proxy data usage by ~80% (images, fonts, media, trackers).
-                const BLOCKED_RESOURCE_TYPES = new Set([
-                    'image', 'media', 'font', 'stylesheet',
-                ]);
-                // Also block third-party domains that add weight but no data value
-                const BLOCKED_DOMAINS = [
-                    'google-analytics.com', 'doubleclick.net', 'googlesyndication.com',
-                    'facebook.net', // pixel / analytics (different from facebook.com)
-                    'connect.facebook.net',
-                    'static.xx.fbcdn.net', // CDN static assets
-                    'scontent', // user-generated media CDN
-                    'video.f', // video CDN
+                // Block heavy binary resources to reduce proxy data usage.
+                // Stylesheets and scripts must pass through — Facebook needs them
+                // to execute the __rd_verify challenge and render the ad feed.
+                const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
+                // Block third-party media CDNs (images/videos of ad creatives)
+                const BLOCKED_URL_FRAGMENTS = [
+                    'google-analytics.com', 'doubleclick.net',
+                    'scontent.f', // fbcdn user-generated image/video CDN
+                    'video.f',    // fbcdn video CDN
                 ];
                 await page.route('**/*', async (route) => {
                     const req = route.request();
-                    const resourceType = req.resourceType();
-                    const url = req.url();
-
-                    if (BLOCKED_RESOURCE_TYPES.has(resourceType)) {
+                    if (BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
                         await route.abort();
                         return;
                     }
-                    if (BLOCKED_DOMAINS.some(d => url.includes(d))) {
+                    const url = req.url();
+                    if (BLOCKED_URL_FRAGMENTS.some(f => url.includes(f))) {
                         await route.abort();
                         return;
                     }
@@ -535,94 +530,133 @@ async function fetchFbTokensViaBrowser(
                         await route.continue();
                     }
                 });
-
-                // Capture the async search_ads responses that the page makes naturally
-                // while loading — these are perfectly valid AJAX responses with ad data.
-                const capturedBodies: string[] = [];
-                page.on('response', async (resp) => {
-                    const url = resp.url();
-                    if (!url.includes('async/search_ads') && !url.includes('api/graphql')) return;
-                    if (resp.status() < 200 || resp.status() >= 300) return;
-                    try {
-                        const text = await resp.text();
-                        if (text.includes('adArchiveID') || text.includes('ad_archive_id')) {
-                            crawleeLog.info(`Captured search response: ${text.length} chars from ${url.slice(0, 80)}`);
-                            capturedBodies.push(text);
-                        }
-                    } catch { /* ignore */ }
-                });
-                request.userData['capturedBodies'] = capturedBodies;
             },
         ],
 
         async requestHandler({ page, log, request }) {
-            log.info('Browser warmup: page loaded, waiting for challenge resolution...');
+            log.info('Browser: page loaded, waiting for challenge resolution...');
 
             // The __rd_verify challenge JS runs automatically:
             //   fetch('/__rd_verify_...', { method: 'POST' }).finally(() => window.location.reload())
-            // We wait for the reload to complete after the challenge POST.
-            // Strategy: wait for networkidle twice — once for initial load, once after reload.
-            for (let i = 0; i < 2; i++) {
+            // Wait for up to 2 reload cycles for the challenge to clear.
+            for (let i = 0; i < 3; i++) {
                 try {
                     await page.waitForLoadState('networkidle', { timeout: 20000 });
                 } catch { /* continue */ }
                 await page.waitForTimeout(2000);
                 const html = await page.content();
-                if (!html.includes('__rd_verify')) break; // challenge resolved
+                if (!html.includes('__rd_verify')) break;
                 log.info(`Challenge still present after wait ${i + 1}, continuing...`);
             }
-
-            // Scroll to trigger lazy-load of ads (browser's own async/search_ads AJAX calls)
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-            await page.waitForTimeout(1500);
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            // Wait for the AJAX requests triggered by scroll to complete
-            try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch { /* ok */ }
-            await page.waitForTimeout(1000);
-
-            const capturedBodies: string[] = (request.userData['capturedBodies'] as string[]) ?? [];
-            log.info(`Captured ${capturedBodies.length} search response(s) from browser network`);
 
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
 
             const html = await page.content();
             log.info(`Browser page size: ${html.length} chars`);
-            log.info(`HTML preview: ${html.slice(0, 400).replace(/\n/g, ' ')}`);
 
-            // Extract cookies from browser context
+            // Extract cookies
             const browserCookies = await page.context().cookies();
             const cookieMap: Record<string, string> = {};
-            for (const c of browserCookies) {
-                cookieMap[c.name] = c.value;
-            }
+            for (const c of browserCookies) cookieMap[c.name] = c.value;
             const cookieHeader = cookieMapToHeader(cookieMap);
             log.info(`Browser cookies: ${Object.keys(cookieMap).join(', ')}`);
 
-            // Try extracting dtsg from window.__bbox (in-memory Relay store) first,
-            // then fall back to HTML regex patterns.
-            let dtsg = '';
-            try {
-                dtsg = await page.evaluate((): string => {
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const bbox = (window as any).__bbox;
-                    if (!bbox) return '';
-                    function find(obj: unknown, depth: number): string {
-                        if (depth > 6 || !obj || typeof obj !== 'object') return '';
-                        const r = obj as Record<string, unknown>;
-                        if (typeof r['token'] === 'string' && (r['token'] as string).startsWith('AQ')) return r['token'] as string;
-                        for (const v of Object.values(r)) { const t = find(v, depth + 1); if (t) return t; }
-                        return '';
+            // Extract lsd from HTML (needed for HTTP fallback pagination)
+            const { lsd } = extractTokensFromHtml(html);
+
+            // Extract dtsg via page.evaluate — use the browser's own fetch to POST
+            // async/search_ads with all session cookies automatically included.
+            // This is more reliable than HTTP because there's no IP/cookie mismatch.
+            const adTypeValue = AD_TYPE_MAP[(searchUrl.includes('ad_type=') ? new URL(searchUrl).searchParams.get('ad_type') ?? 'all' : 'all')];
+            const activeStatusValue = ACTIVE_STATUS_MAP[(searchUrl.includes('active_status=') ? new URL(searchUrl).searchParams.get('active_status') ?? 'all' : 'all')];
+            const qValue = new URL(searchUrl).searchParams.get('q') ?? '';
+            const countryValue = (new URL(searchUrl).searchParams.get('country') ?? 'BR').toUpperCase();
+
+            // Fetch page 1 via browser's own fetch (cookies + CSRF automatically handled)
+            const capturedBodies: string[] = [];
+            const pageSize = 30;
+            const maxPages = Math.ceil((request.userData['maxItems'] as number ?? 100) / pageSize);
+
+            for (let page_i = 0; page_i < maxPages; page_i++) {
+                const offset = page_i * pageSize;
+                log.info(`Browser fetch: async/search_ads page ${page_i + 1}, offset=${offset}`);
+                try {
+                    const responseText = await page.evaluate(async (params: {
+                        q: string; country: string; adType: string; activeStatus: string;
+                        count: number; offset: number;
+                    }): Promise<string> => {
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        const w = window as any;
+                        // Get dtsg from window store
+                        let dtsg = '';
+                        try {
+                            const bbox = w.__bbox;
+                            function findToken(obj: unknown, d: number): string {
+                                if (d > 6 || !obj || typeof obj !== 'object') return '';
+                                const r = obj as Record<string, unknown>;
+                                if (typeof r['token'] === 'string' && (r['token'] as string).startsWith('AQ')) return r['token'] as string;
+                                for (const v of Object.values(r)) { const t = findToken(v, d + 1); if (t) return t; }
+                                return '';
+                            }
+                            if (bbox) dtsg = findToken(bbox, 0);
+                        } catch { /* ignore */ }
+                        // Get lsd from meta tag or inline script
+                        if (!dtsg) {
+                            const m = document.body.innerHTML.match(/"token"\s*:\s*"(AQ[^"]{10,})"/);
+                            if (m) dtsg = m[1];
+                        }
+                        const lsdMeta = document.querySelector('input[name="lsd"]') as HTMLInputElement | null;
+                        const lsd = lsdMeta?.value ?? (document.body.innerHTML.match(/"LSD",\[\],\{"token":"([^"]+)"/))?.[1] ?? '';
+
+                        const body = new URLSearchParams({
+                            q: params.q,
+                            count: String(params.count),
+                            active_status: params.activeStatus,
+                            ad_type: params.adType,
+                            countries: `["${params.country}"]`,
+                            media_type: 'all',
+                            search_type: 'keyword_unordered',
+                            start_index: String(params.offset),
+                            ...(dtsg ? { fb_dtsg: dtsg } : {}),
+                            ...(lsd ? { lsd } : {}),
+                        });
+
+                        const resp = await fetch('https://www.facebook.com/ads/library/async/search_ads/', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Accept': '*/*',
+                            },
+                            credentials: 'include',
+                            body: body.toString(),
+                        });
+                        return await resp.text();
+                    }, { q: qValue, country: countryValue, adType: adTypeValue ?? 'all', activeStatus: activeStatusValue ?? 'all', count: pageSize, offset });
+
+                    const isHtml = responseText.trimStart().startsWith('<!');
+                    const hasAds = responseText.includes('adArchiveID') || responseText.includes('ad_archive_id');
+                    log.info(`  Page ${page_i + 1}: ${responseText.length} chars, isHtml=${isHtml}, hasAds=${hasAds}`);
+
+                    if (isHtml || !hasAds) {
+                        log.info('  No ad data in response — stopping pagination');
+                        if (page_i === 0) {
+                            // Log preview to diagnose
+                            log.info(`  Response preview: ${responseText.slice(0, 400).replace(/\n/g, ' ')}`);
+                        }
+                        break;
                     }
-                    return find(bbox, 0);
-                });
-            } catch { /* ignore */ }
+                    capturedBodies.push(responseText);
+                } catch (err) {
+                    log.error(`  Browser fetch failed on page ${page_i + 1}: ${(err as Error).message}`);
+                    break;
+                }
+            }
 
-            const { dtsg: dtsgHtml, lsd } = extractTokensFromHtml(html);
-            if (!dtsg) dtsg = dtsgHtml;
-            log.info(`Tokens — dtsg: ${dtsg ? 'OK (' + dtsg.slice(0, 8) + '...)' : 'MISSING'}, lsd: ${lsd ? 'OK (' + lsd + ')' : 'MISSING'}`);
+            log.info(`Browser fetch complete: ${capturedBodies.length} page(s) with ad data captured`);
 
-            result = { cookies: cookieHeader, dtsg, lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
+            result = { cookies: cookieHeader, dtsg: '', lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
         },
 
         failedRequestHandler({ log }, error) {
@@ -630,115 +664,17 @@ async function fetchFbTokensViaBrowser(
         },
     });
 
-    await warmupCrawler.run([{ url: searchUrl }]);
+    await warmupCrawler.run([{ url: searchUrl, userData: { maxItems } }]);
     return result;
 }
 
-// ─── Main async API scraper ────────────────────────────────────────────────────
+// ─── Search params type ────────────────────────────────────────────────────────
 
 interface SearchParams {
     search: string;
     country: string;
     adType: string;
     activeStatus: string;
-}
-
-async function scrapeViaAsyncAPI(
-    searchParams: SearchParams,
-    tokens: FbTokens,
-    proxyUrl: string | undefined,
-    maxItems: number,
-    endPage: number,
-    sourceURL: string,
-    customData: Record<string, unknown> | null,
-    startOffset = 0,
-): Promise<ProcessedAd[]> {
-    const results: ProcessedAd[] = [];
-    const seenIds = new Set<string>();
-
-    const adTypeValue = AD_TYPE_MAP[(searchParams.adType ?? 'ALL').toUpperCase()] ?? 'all';
-    const activeStatusValue = ACTIVE_STATUS_MAP[(searchParams.activeStatus ?? 'ALL').toUpperCase()] ?? 'all';
-
-    let offset = startOffset;
-    const pageSize = 30;
-    let pageNum = 0;
-
-    while (true) {
-        if (maxItems > 0 && results.length >= maxItems) break;
-        if (endPage > 0 && pageNum >= endPage) break;
-
-        // Build form data for the async search endpoint
-        const formData = new URLSearchParams({
-            q: searchParams.search,
-            count: String(pageSize),
-            active_status: activeStatusValue,
-            ad_type: adTypeValue,
-            countries: `["${searchParams.country.toUpperCase()}"]`,
-            media_type: 'all',
-            search_type: 'keyword_unordered',
-            start_index: String(offset),
-            ...(tokens.dtsg ? { fb_dtsg: tokens.dtsg } : {}),
-            ...(tokens.lsd ? { lsd: tokens.lsd } : {}),
-        });
-
-        crawleeLog.info(`Fetching async API page ${pageNum + 1}, offset=${offset}, query="${searchParams.search}"`);
-
-        let responseText: string;
-        try {
-            const resp = await gotScraping({
-                url: ASYNC_SEARCH_URL,
-                method: 'POST',
-                body: formData.toString(),
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Cookie': tokens.cookies,
-                    'Referer': sourceURL,
-                    'Origin': 'https://www.facebook.com',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8',
-                },
-                headerGeneratorOptions: {
-                    browsers: [{ name: 'chrome', minVersion: 120 }],
-                    operatingSystems: ['windows'],
-                },
-                proxyUrl,
-                followRedirect: true,
-                timeout: { request: 30000 },
-            });
-            responseText = resp.body as string;
-        } catch (err) {
-            crawleeLog.error(`Async API request failed: ${(err as Error).message}`);
-            break;
-        }
-
-        const adsOnPage = parseAdsFromResponseText(responseText);
-        crawleeLog.info(`Page ${pageNum + 1}: found ${adsOnPage.length} ads in response (response size: ${responseText.length})`);
-
-        if (adsOnPage.length === 0) {
-            // Log first 800 chars to help diagnose what Facebook returned
-            crawleeLog.info(`Response preview: ${responseText.slice(0, 800).replace(/\n/g, ' ')}`);
-            crawleeLog.info('No ads returned — reached end of results or blocked.');
-            break;
-        }
-
-        for (const raw of adsOnPage) {
-            if (maxItems > 0 && results.length >= maxItems) break;
-            const processed = processAd(raw, sourceURL, customData);
-            if (!processed) continue;
-            if (seenIds.has(processed.adArchiveID)) continue;
-            seenIds.add(processed.adArchiveID);
-            results.push(processed);
-        }
-
-        pageNum++;
-        offset += pageSize;
-
-        // Small delay between pages to be polite
-        await new Promise(resolve => setTimeout(resolve, 500 + Math.floor(Math.random() * 500)));
-    }
-
-    return results;
 }
 
 // ─── URL parsing helpers ───────────────────────────────────────────────────────
@@ -883,11 +819,12 @@ for (const sourceURL of initialURLs) {
 
     crawleeLog.info(`Search params: ${JSON.stringify(searchParams)}`);
 
-    // Step 1: Use Playwright browser to solve __rd_verify challenge and get tokens/cookies.
-    // Only ONE page load with a real browser — all data requests are HTTP-only.
+    // Step 1: Use Playwright browser to solve __rd_verify challenge and fetch all
+    // ad pages via browser's own fetch (page.evaluate) — no IP/cookie mismatch issues.
+    const remainingForUrl = maxItems > 0 ? maxItems - totalScraped : 0;
     let tokens: FbTokens;
     try {
-        tokens = await fetchFbTokensViaBrowser(sourceURL, proxyConfiguration);
+        tokens = await fetchFbTokensViaBrowser(sourceURL, proxyConfiguration, remainingForUrl);
     } catch (err) {
         crawleeLog.error(`Failed to fetch tokens from ${sourceURL}: ${(err as Error).message}`);
         continue;
@@ -918,40 +855,7 @@ for (const sourceURL of initialURLs) {
         }
     }
 
-    crawleeLog.info(`Got ${ads.length} ads from browser-captured responses for URL: ${sourceURL}`);
-
-    // Step 2b: If we still need more ads (or captured nothing), call the async API
-    // with pagination (pure HTTP, no browser).
-    // IMPORTANT: use tokens.proxyUrl — the exact same IP the browser used,
-    // because rd_challenge cookies are bound to that IP.
-    const remaining = maxItems > 0 ? maxItems - totalScraped - ads.length : 0;
-    const needMoreAds = (maxItems === 0 || ads.length < maxItems) && tokens.lsd;
-
-    if (needMoreAds) {
-        crawleeLog.info(`Using pinned proxy for HTTP calls: ${tokens.proxyUrl ? 'set' : 'none'}`);
-        // Calculate how many pages to skip (browser already loaded the first batch)
-        const firstPageOffset = ads.length > 0 ? ads.length : 0;
-        const httpAds = await scrapeViaAsyncAPI(
-            searchParams,
-            tokens,
-            tokens.proxyUrl,
-            remaining,
-            endPage,
-            sourceURL,
-            customData,
-            firstPageOffset,
-        );
-        crawleeLog.info(`Got ${httpAds.length} additional ads from async HTTP API for URL: ${sourceURL}`);
-        for (const ad of httpAds) {
-            if (seenIds.has(ad.adArchiveID)) continue;
-            seenIds.add(ad.adArchiveID);
-            ads.push(ad);
-        }
-    } else if (!tokens.lsd) {
-        crawleeLog.warning('lsd token missing — skipping HTTP pagination (browser-captured ads only)');
-    }
-
-    crawleeLog.info(`Total ads for URL: ${ads.length}`);
+    crawleeLog.info(`Total ads for URL: ${ads.length} (all fetched via browser in-page fetch)`);
 
     // Step 3: Push to dataset
     for (const ad of ads) {
