@@ -357,6 +357,14 @@ async function fetchFbTokensViaBrowser(
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
 
+            // Diagnostic: check if React/the ad feed actually mounted
+            const feedCheck = await page.evaluate((): string => {
+                const hasReact = !!(document.querySelector('[data-pagelet="AdsLibrary"]') ?? document.querySelector('[data-testid="ads-library-results"]') ?? document.querySelector('._8nfl'));
+                const bodyText = document.body.innerText.slice(0, 200).replace(/\n/g, ' ');
+                return `reactMounted=${hasReact}, bodyStart="${bodyText}"`;
+            });
+            log.info(`Feed check: ${feedCheck}`);
+
             // Scroll repeatedly to trigger lazy-loaded ad batches.
             // Each scroll to the bottom causes the React feed to fetch the next
             // async/search_ads page — we capture those responses via page.on('response').
