@@ -530,6 +530,23 @@ async function fetchFbTokensViaBrowser(
                         await route.continue();
                     }
                 });
+
+                // Passively capture async/search_ads responses the browser makes while rendering.
+                // These are authentic AJAX responses with full ad data — no token replication needed.
+                const capturedBodies: string[] = [];
+                page.on('response', async (resp) => {
+                    const url = resp.url();
+                    if (!url.includes('async/search_ads') && !url.includes('api/graphql')) return;
+                    if (resp.status() < 200 || resp.status() >= 300) return;
+                    try {
+                        const text = await resp.text();
+                        if (text.includes('adArchiveID') || text.includes('ad_archive_id')) {
+                            crawleeLog.info(`Captured response: ${text.length} chars from ${url.slice(0, 80)}`);
+                            capturedBodies.push(text);
+                        }
+                    } catch { /* ignore */ }
+                });
+                request.userData['capturedBodies'] = capturedBodies;
             },
         ],
 
@@ -538,7 +555,7 @@ async function fetchFbTokensViaBrowser(
 
             // The __rd_verify challenge JS runs automatically:
             //   fetch('/__rd_verify_...', { method: 'POST' }).finally(() => window.location.reload())
-            // Wait for up to 2 reload cycles for the challenge to clear.
+            // Wait for up to 3 cycles for the challenge to clear.
             for (let i = 0; i < 3; i++) {
                 try {
                     await page.waitForLoadState('networkidle', { timeout: 20000 });
@@ -552,6 +569,16 @@ async function fetchFbTokensViaBrowser(
             const finalUrl = page.url();
             log.info(`Browser final URL: ${finalUrl}`);
 
+            // Scroll to trigger lazy-loaded ad responses
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
+            await page.waitForTimeout(1500);
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch { /* ok */ }
+            await page.waitForTimeout(1000);
+
+            const capturedBodies: string[] = (request.userData['capturedBodies'] as string[]) ?? [];
+            log.info(`Captured ${capturedBodies.length} search response(s) from browser network`);
+
             const html = await page.content();
             log.info(`Browser page size: ${html.length} chars`);
 
@@ -562,97 +589,10 @@ async function fetchFbTokensViaBrowser(
             const cookieHeader = cookieMapToHeader(cookieMap);
             log.info(`Browser cookies: ${Object.keys(cookieMap).join(', ')}`);
 
-            // Extract tokens from HTML
-            const { dtsg, lsd } = extractTokensFromHtml(html);
+            const { lsd } = extractTokensFromHtml(html);
+            log.info(`lsd: ${lsd ? 'OK' : 'MISSING'}`);
 
-            // Also try window.__bbox for dtsg
-            let dtsgFinal = dtsg;
-            if (!dtsgFinal) {
-                try {
-                    dtsgFinal = await page.evaluate((): string => {
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        const bbox = (window as any).__bbox;
-                        if (!bbox) return '';
-                        function find(obj: unknown, d: number): string {
-                            if (d > 6 || !obj || typeof obj !== 'object') return '';
-                            const r = obj as Record<string, unknown>;
-                            if (typeof r['token'] === 'string' && (r['token'] as string).startsWith('AQ')) return r['token'] as string;
-                            for (const v of Object.values(r)) { const t = find(v, d + 1); if (t) return t; }
-                            return '';
-                        }
-                        return find(bbox, 0);
-                    });
-                } catch { /* ignore */ }
-            }
-            log.info(`Tokens — dtsg: ${dtsgFinal ? 'OK' : 'MISSING'}, lsd: ${lsd ? 'OK' : 'MISSING'}`);
-
-            const adTypeValue = AD_TYPE_MAP[new URL(searchUrl).searchParams.get('ad_type') ?? 'all'] ?? 'all';
-            const activeStatusValue = ACTIVE_STATUS_MAP[new URL(searchUrl).searchParams.get('active_status') ?? 'all'] ?? 'all';
-            const qValue = new URL(searchUrl).searchParams.get('q') ?? '';
-            const countryValue = (new URL(searchUrl).searchParams.get('country') ?? 'BR').toUpperCase();
-
-            // Use page.context().request to POST directly from the browser's network context.
-            // This reuses the browser's cookie jar (including rd_challenge, xs, datr) and
-            // the same proxy IP — unlike gotScraping which is a separate Node HTTP client.
-            const capturedBodies: string[] = [];
-            const pageSize = 30;
-            const maxPages = Math.ceil((request.userData['maxItems'] as number ?? 100) / pageSize);
-            const browserRequest = page.context().request;
-
-            for (let page_i = 0; page_i < maxPages; page_i++) {
-                const offset = page_i * pageSize;
-                log.info(`Browser context POST: async/search_ads page ${page_i + 1}, offset=${offset}`);
-                try {
-                    const formData: Record<string, string> = {
-                        q: qValue,
-                        count: String(pageSize),
-                        active_status: activeStatusValue,
-                        ad_type: adTypeValue,
-                        countries: `["${countryValue}"]`,
-                        media_type: 'all',
-                        search_type: 'keyword_unordered',
-                        start_index: String(offset),
-                    };
-                    if (dtsgFinal) formData['fb_dtsg'] = dtsgFinal;
-                    if (lsd) formData['lsd'] = lsd;
-
-                    const resp = await browserRequest.post(
-                        'https://www.facebook.com/ads/library/async/search_ads/',
-                        {
-                            form: formData,
-                            headers: {
-                                'X-Requested-With': 'XMLHttpRequest',
-                                'Referer': searchUrl,
-                                'Origin': 'https://www.facebook.com',
-                                'Accept': '*/*',
-                                'Accept-Language': 'en-US,en;q=0.9',
-                            },
-                        },
-                    );
-                    const responseText = await resp.text();
-                    const isHtml = responseText.trimStart().startsWith('<!');
-                    const hasAds = responseText.includes('adArchiveID') || responseText.includes('ad_archive_id');
-                    log.info(`  Page ${page_i + 1}: ${responseText.length} chars, status=${resp.status()}, isHtml=${isHtml}, hasAds=${hasAds}`);
-
-                    if (isHtml || !hasAds) {
-                        log.info('  No ad data in response — stopping pagination');
-                        if (page_i === 0) {
-                            log.info(`  Response preview: ${responseText.slice(0, 400).replace(/\n/g, ' ')}`);
-                        }
-                        break;
-                    }
-                    capturedBodies.push(responseText);
-                    // Small polite delay between pages
-                    if (page_i < maxPages - 1) await page.waitForTimeout(300 + Math.floor(Math.random() * 400));
-                } catch (err) {
-                    log.error(`  Browser context POST failed on page ${page_i + 1}: ${(err as Error).message}`);
-                    break;
-                }
-            }
-
-            log.info(`Browser context POST complete: ${capturedBodies.length} page(s) with ad data captured`);
-
-            result = { cookies: cookieHeader, dtsg: dtsgFinal, lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
+            result = { cookies: cookieHeader, dtsg: '', lsd, proxyUrl: pinnedProxyUrl, capturedSearchResponses: capturedBodies };
         },
 
         failedRequestHandler({ log }, error) {
