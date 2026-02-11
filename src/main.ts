@@ -535,25 +535,69 @@ async function fetchFbTokensViaBrowser(
             const targetItems = (request.userData['maxItems'] as number) ?? 100;
             const capturedBodies: string[] = (request.userData['capturedBodies'] as string[]) ?? [];
 
-            // The first batch of ads is SSR-embedded in the page HTML (not sent via
-            // async/search_ads network requests). Extract the inline JSON data now.
             const html = await page.content();
             log.info(`Browser page size: ${html.length} chars`);
 
-            // Add the full page HTML as a "response body" — parseAdsFromPageHtml
-            // will handle extraction of SSR-embedded ad data.
-            if (html.includes('adArchiveID') || html.includes('ad_archive_id')) {
-                log.info('Found ad data embedded in page HTML — adding to captured bodies');
-                capturedBodies.push(html);
+            // page.content() returns the live DOM — React has already consumed the SSR
+            // <script> data blobs and rendered them into DOM elements. Extract ad data
+            // directly from the React component tree via page.evaluate().
+            const domAdsJson = await page.evaluate((): string => {
+                // Try to find ad data in window.__initialData__, Relay store, or similar
+                const win = window as unknown as Record<string, unknown>;
 
-                // Save a debug snippet: 500 chars around the first adArchiveID occurrence
-                // Check multiple forms to understand the encoding
-                for (const marker of ['"adArchiveID"', '\\"adArchiveID\\"', 'adArchiveID']) {
-                    const markerIdx = html.indexOf(marker);
-                    if (markerIdx !== -1) {
-                        const snippet = html.slice(Math.max(0, markerIdx - 100), markerIdx + 200);
-                        log.info(`adArchiveID [${marker}] snippet: ${JSON.stringify(snippet).slice(0, 400)}`);
-                        break;
+                // Strategy 1: Look for Relay/GraphQL store on window
+                for (const key of ['__RELAY_STORE__', '__initialData__', '__SSR_DATA__', 'initialData']) {
+                    if (win[key]) {
+                        try { return JSON.stringify(win[key]); } catch { /* skip */ }
+                    }
+                }
+
+                // Strategy 2: Find all script[type="application/json"] tags
+                const jsonScripts = Array.from(document.querySelectorAll('script[type="application/json"]'));
+                for (const s of jsonScripts) {
+                    const text = s.textContent ?? '';
+                    if (text.includes('adArchiveID')) return text;
+                }
+
+                // Strategy 3: Scan all script tags for adArchiveID
+                const allScripts = Array.from(document.querySelectorAll('script:not([src])'));
+                for (const s of allScripts) {
+                    const text = s.textContent ?? '';
+                    if (text.includes('adArchiveID')) {
+                        return text.slice(0, 50000); // cap at 50KB
+                    }
+                }
+
+                // Strategy 4: Check for __bbox / ScheduledServerJS in script text
+                for (const s of allScripts) {
+                    const text = s.textContent ?? '';
+                    if (text.includes('__bbox') || text.includes('ScheduledServerJS')) {
+                        if (text.length > 1000) return text.slice(0, 50000);
+                    }
+                }
+
+                return '';
+            });
+
+            if (domAdsJson) {
+                log.info(`Found potential ad data via DOM eval (${domAdsJson.length} chars)`);
+                // Log first 300 chars to understand the structure
+                log.info(`DOM data snippet: ${JSON.stringify(domAdsJson.slice(0, 300))}`);
+                capturedBodies.push(domAdsJson);
+            } else {
+                log.warning('No ad data found via DOM eval — checking raw HTML');
+                // Fallback: raw HTML
+                if (html.includes('adArchiveID') || html.includes('ad_archive_id')) {
+                    log.info('Found adArchiveID in raw HTML — adding to captured bodies');
+                    capturedBodies.push(html);
+                    // Log context
+                    for (const marker of ['"adArchiveID"', '\\"adArchiveID\\"', 'adArchiveID']) {
+                        const idx = html.indexOf(marker);
+                        if (idx !== -1) {
+                            const snippet = html.slice(Math.max(0, idx - 100), idx + 200);
+                            log.info(`HTML [${marker}]: ${JSON.stringify(snippet).slice(0, 300)}`);
+                            break;
+                        }
                     }
                 }
             }
