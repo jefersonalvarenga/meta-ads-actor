@@ -2,7 +2,7 @@
     "name": "facebook-ads-library-scraper",
     "version": "1.0.0",
     "type": "module",
-    "description": "Scrapes ads from Facebook Ads Library using Playwright",
+    "description": "Scrapes ads from Facebook Ads Library via HTTP (no browser required)",
     "main": "dist/main.js",
     "scripts": {
         "build": "tsc -p tsconfig.json",
@@ -16,8 +16,7 @@
         "typescript": "^5.4.0"
     },
     "devDependencies": {
-        "@types/node": "^20.0.0",
-        "playwright": "^1.58.2"
+        "@types/node": "^20.0.0"
     },
     "engines": {
         "node": ">=18.0.0"
