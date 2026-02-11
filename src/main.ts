@@ -178,6 +178,63 @@ function parseAdsFromResponseText(text: string): RawAd[] {
     return ads;
 }
 
+/**
+ * Extract ad data from the SSR HTML of the Facebook Ad Library page.
+ * Facebook embeds the initial data as JSON inside <script> tags in the format:
+ *   require("ScheduledServerJS").handle({"__bbox":{"require":[...]}})
+ * or as __SSR_DATA__ / requireLazy blobs.
+ * We scan all script tag contents for JSON objects containing adArchiveID.
+ */
+function parseAdsFromPageHtml(html: string): RawAd[] {
+    const ads: RawAd[] = [];
+    const seen = new Set<string>();
+
+    // Extract all JSON-like blobs from script tags and inline data attributes.
+    // Strategy: find all occurrences of "adArchiveID" and walk outward to find
+    // the containing JSON object boundary.
+    const marker = '"adArchiveID"';
+    let searchFrom = 0;
+    while (true) {
+        const markerPos = html.indexOf(marker, searchFrom);
+        if (markerPos === -1) break;
+        searchFrom = markerPos + marker.length;
+
+        // Walk backward to find the nearest { that starts an object containing this key
+        let depth = 0;
+        let objStart = -1;
+        for (let i = markerPos; i >= Math.max(0, markerPos - 5000); i--) {
+            if (html[i] === '}') depth++;
+            else if (html[i] === '{') {
+                if (depth === 0) { objStart = i; break; }
+                depth--;
+            }
+        }
+        if (objStart === -1) continue;
+
+        // Walk forward to find the matching closing }
+        depth = 0;
+        let objEnd = -1;
+        for (let i = objStart; i < Math.min(html.length, objStart + 10000); i++) {
+            if (html[i] === '{') depth++;
+            else if (html[i] === '}') {
+                depth--;
+                if (depth === 0) { objEnd = i; break; }
+            }
+        }
+        if (objEnd === -1) continue;
+
+        const candidate = html.slice(objStart, objEnd + 1);
+        if (seen.has(candidate)) continue;
+        seen.add(candidate);
+
+        let json: unknown;
+        try { json = JSON.parse(candidate); } catch { continue; }
+        const found = findAdsInObject(json);
+        ads.push(...found);
+    }
+    return ads;
+}
+
 // ─── Token & Cookie extraction helpers ────────────────────────────────────────
 
 interface FbTokens {
@@ -411,18 +468,27 @@ async function fetchFbTokensViaBrowser(
                 } catch { /* ignore */ }
             }
 
-            // Scroll repeatedly to trigger lazy-loaded ad batches.
-            // Each scroll to the bottom causes the React feed to fetch the next
-            // async/search_ads page — we capture those responses via page.on('response').
             const targetItems = (request.userData['maxItems'] as number) ?? 100;
             const capturedBodies: string[] = (request.userData['capturedBodies'] as string[]) ?? [];
 
-            let lastCapturedCount = 0;
+            // The first batch of ads is SSR-embedded in the page HTML (not sent via
+            // async/search_ads network requests). Extract the inline JSON data now.
+            const html = await page.content();
+            log.info(`Browser page size: ${html.length} chars`);
+
+            // Add the full page HTML as a "response body" — parseAdsFromResponseText
+            // already handles both newline-delimited JSON and embedded script JSON.
+            if (html.includes('adArchiveID') || html.includes('ad_archive_id')) {
+                log.info('Found ad data embedded in page HTML — adding to captured bodies');
+                capturedBodies.push(html);
+            }
+
+            // Scroll to trigger lazy-loaded batches (async/search_ads calls for pages 2+).
+            let lastCapturedCount = capturedBodies.length;
             let noNewResponseRounds = 0;
-            const MAX_NO_NEW_ROUNDS = 3; // stop if 3 consecutive scrolls yield nothing new
+            const MAX_NO_NEW_ROUNDS = 3;
 
             for (let scrollRound = 0; scrollRound < 20; scrollRound++) {
-                // Count ads captured so far (rough estimate: ~30 per response)
                 const estimatedAds = capturedBodies.length * 30;
                 if (targetItems > 0 && estimatedAds >= targetItems) break;
 
@@ -443,10 +509,7 @@ async function fetchFbTokensViaBrowser(
                 }
             }
 
-            log.info(`Captured ${capturedBodies.length} search response(s) from browser network`);
-
-            const html = await page.content();
-            log.info(`Browser page size: ${html.length} chars`);
+            log.info(`Total captured bodies (HTML + network): ${capturedBodies.length}`);
 
             // Extract cookies
             const browserCookies = await page.context().cookies();
@@ -654,8 +717,11 @@ for (const sourceURL of initialURLs) {
 
     crawleeLog.info(`Processing ${tokens.capturedSearchResponses.length} captured browser response(s)...`);
     for (const body of tokens.capturedSearchResponses) {
-        const rawAds = parseAdsFromResponseText(body);
-        crawleeLog.info(`  → ${rawAds.length} ads found in captured response`);
+        // Use HTML parser for full page content, JSON parser for async API responses
+        const rawAds = body.trimStart().startsWith('<')
+            ? parseAdsFromPageHtml(body)
+            : parseAdsFromResponseText(body);
+        crawleeLog.info(`  → ${rawAds.length} ads found in captured response (${body.trimStart().startsWith('<') ? 'HTML' : 'JSON'})`);
         for (const raw of rawAds) {
             if (maxItems > 0 && ads.length >= maxItems) break;
             const processed = processAd(raw, customData);
