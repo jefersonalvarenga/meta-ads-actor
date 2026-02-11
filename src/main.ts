@@ -440,10 +440,23 @@ function extractTokensFromHtml(html: string): { dtsg: string; lsd: string } {
 }
 
 /**
+ * Checks if an HTML body is the Facebook __rd_verify challenge page,
+ * and if so extracts the challenge URL path.
+ * Returns null if not a challenge page.
+ */
+function extractChallengeUrl(html: string): string | null {
+    // matches: fetch('/__rd_verify_...?challenge=N', { method: 'POST' })
+    const m = html.match(/fetch\s*\(\s*'(\/__rd_verify_[^']+)'\s*,/);
+    return m?.[1] ?? null;
+}
+
+/**
  * Fetches tokens and cookies needed for the async API.
  * Strategy:
  *   1. GET facebook.com to establish a session and collect initial cookies (datr, etc.)
- *   2. GET the Ad Library page with those cookies to get lsd/dtsg tokens
+ *   2. GET the Ad Library page — may return a __rd_verify challenge
+ *   3. If challenge detected: POST to the challenge URL, then re-GET the Ad Library
+ *   4. Extract lsd/dtsg from the final HTML
  */
 async function fetchFbTokens(
     searchUrl: string,
@@ -451,7 +464,7 @@ async function fetchFbTokens(
 ): Promise<FbTokens> {
     const cookieMap: Record<string, string> = {};
 
-    const commonHeaders = {
+    const navHeaders = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -464,12 +477,22 @@ async function fetchFbTokens(
         'Cache-Control': 'max-age=0',
     };
 
+    const fetchHeaders = {
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+    };
+
     // Step 1: GET facebook.com homepage to collect datr / initial session cookies
     crawleeLog.info('Step 1: GET facebook.com for initial cookies...');
     try {
         const homeResp = await gotScraping({
             url: 'https://www.facebook.com/',
-            headers: commonHeaders,
+            headers: navHeaders,
             headerGeneratorOptions: {
                 browsers: [{ name: 'chrome', minVersion: 120 }],
                 operatingSystems: ['windows'],
@@ -479,43 +502,84 @@ async function fetchFbTokens(
             followRedirect: true,
             timeout: { request: 30000 },
         });
-        crawleeLog.info(`homepage status: ${homeResp.statusCode}, cookies: ${(homeResp.headers['set-cookie'] as string[] | undefined)?.length ?? 0}`);
+        crawleeLog.info(`homepage status: ${homeResp.statusCode}, set-cookie count: ${(homeResp.headers['set-cookie'] as string[] | undefined)?.length ?? 0}`);
         mergeCookies(cookieMap, homeResp.headers['set-cookie'] as string[] | undefined);
     } catch (err) {
         crawleeLog.warning(`homepage GET failed: ${(err as Error).message}`);
     }
 
-    // Small delay between requests
-    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
+    await new Promise(r => setTimeout(r, 600 + Math.random() * 600));
 
-    // Step 2: GET the Ad Library page to get lsd/dtsg tokens
-    crawleeLog.info(`Step 2: GET Ad Library page for tokens...`);
-    const adLibResp = await gotScraping({
-        url: searchUrl,
-        headers: {
-            ...commonHeaders,
-            'Referer': 'https://www.facebook.com/',
-            'Cookie': cookieMapToHeader(cookieMap),
-        },
-        headerGeneratorOptions: {
-            browsers: [{ name: 'chrome', minVersion: 120 }],
-            operatingSystems: ['windows'],
-            locales: ['en-US', 'pt-BR'],
-        },
-        proxyUrl,
-        followRedirect: true,
-        timeout: { request: 30000 },
-    });
+    // Step 2: GET Ad Library page (may return challenge)
+    crawleeLog.info('Step 2: GET Ad Library page...');
+    let adLibHtml = '';
+    {
+        const resp = await gotScraping({
+            url: searchUrl,
+            headers: { ...navHeaders, 'Referer': 'https://www.facebook.com/', 'Cookie': cookieMapToHeader(cookieMap) },
+            headerGeneratorOptions: { browsers: [{ name: 'chrome', minVersion: 120 }], operatingSystems: ['windows'], locales: ['en-US', 'pt-BR'] },
+            proxyUrl,
+            followRedirect: true,
+            timeout: { request: 30000 },
+        });
+        crawleeLog.info(`Ad Library status: ${resp.statusCode}, size: ${(resp.body as string).length}`);
+        mergeCookies(cookieMap, resp.headers['set-cookie'] as string[] | undefined);
+        adLibHtml = resp.body as string;
+    }
 
-    crawleeLog.info(`Ad Library page status: ${adLibResp.statusCode}, size: ${(adLibResp.body as string).length} chars`);
-    mergeCookies(cookieMap, adLibResp.headers['set-cookie'] as string[] | undefined);
+    // Step 3: Handle __rd_verify challenge if present
+    const challengePath = extractChallengeUrl(adLibHtml);
+    if (challengePath) {
+        crawleeLog.info(`Challenge detected: ${challengePath} — solving...`);
+        const challengeUrl = `https://www.facebook.com${challengePath}`;
+        try {
+            const chalResp = await gotScraping({
+                url: challengeUrl,
+                method: 'POST',
+                body: '',
+                headers: {
+                    ...fetchHeaders,
+                    'Referer': searchUrl,
+                    'Origin': 'https://www.facebook.com',
+                    'Cookie': cookieMapToHeader(cookieMap),
+                },
+                headerGeneratorOptions: { browsers: [{ name: 'chrome', minVersion: 120 }], operatingSystems: ['windows'] },
+                proxyUrl,
+                followRedirect: true,
+                timeout: { request: 30000 },
+            });
+            crawleeLog.info(`Challenge POST status: ${chalResp.statusCode}, set-cookie: ${(chalResp.headers['set-cookie'] as string[] | undefined)?.length ?? 0}`);
+            mergeCookies(cookieMap, chalResp.headers['set-cookie'] as string[] | undefined);
+        } catch (err) {
+            crawleeLog.warning(`Challenge POST failed: ${(err as Error).message}`);
+        }
 
-    const html = adLibResp.body as string;
+        await new Promise(r => setTimeout(r, 800 + Math.random() * 600));
 
-    // Log first 500 chars for diagnosis
-    crawleeLog.info(`HTML preview: ${html.slice(0, 500).replace(/\n/g, ' ')}`);
+        // Step 4: Re-GET Ad Library with the challenge-resolved cookies
+        crawleeLog.info('Step 4: Re-GET Ad Library after challenge...');
+        const resp2 = await gotScraping({
+            url: searchUrl,
+            headers: { ...navHeaders, 'Referer': 'https://www.facebook.com/', 'Cookie': cookieMapToHeader(cookieMap) },
+            headerGeneratorOptions: { browsers: [{ name: 'chrome', minVersion: 120 }], operatingSystems: ['windows'], locales: ['en-US', 'pt-BR'] },
+            proxyUrl,
+            followRedirect: true,
+            timeout: { request: 30000 },
+        });
+        crawleeLog.info(`Re-GET Ad Library status: ${resp2.statusCode}, size: ${(resp2.body as string).length}`);
+        mergeCookies(cookieMap, resp2.headers['set-cookie'] as string[] | undefined);
+        adLibHtml = resp2.body as string;
 
-    const { dtsg, lsd } = extractTokensFromHtml(html);
+        // Check if we got another challenge
+        const challengePath2 = extractChallengeUrl(adLibHtml);
+        if (challengePath2) {
+            crawleeLog.warning('Still getting challenge after solve attempt — proxy may be blocked');
+        }
+    }
+
+    crawleeLog.info(`HTML preview: ${adLibHtml.slice(0, 400).replace(/\n/g, ' ')}`);
+
+    const { dtsg, lsd } = extractTokensFromHtml(adLibHtml);
     const cookieHeader = cookieMapToHeader(cookieMap);
 
     crawleeLog.info(`Tokens — dtsg: ${dtsg ? 'OK (' + dtsg.slice(0, 8) + '...)' : 'MISSING'}, lsd: ${lsd ? 'OK (' + lsd + ')' : 'MISSING'}, cookies: ${cookieHeader.length} chars (${Object.keys(cookieMap).join(', ')})`);
