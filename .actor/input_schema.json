@@ -55,6 +55,12 @@
             "minimum": 0,
             "editor": "number"
         },
+        "proxyCountry": {
+            "title": "Proxy country",
+            "type": "string",
+            "description": "Two-letter country code for the proxy exit node (e.g. US, BR, GB). Leave empty to let Apify choose automatically. Set this independently from the search country — e.g. search BR ads via a US proxy.",
+            "editor": "textfield"
+        },
         "proxy": {
             "title": "Proxy configuration",
             "type": "object",

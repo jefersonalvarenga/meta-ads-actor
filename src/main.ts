@@ -16,6 +16,7 @@ interface Input {
     activeStatus?: string;
     maxItems?: number;
     endPage?: number;
+    proxyCountry?: string;
     proxy?: {
         useApifyProxy?: boolean;
         apifyProxyGroups?: string[];
@@ -482,6 +483,7 @@ const {
     activeStatus = 'ALL',
     maxItems = 100,
     endPage = 0,
+    proxyCountry,
     proxy,
     customData = null,
 } = input;
@@ -505,11 +507,12 @@ let proxyConfiguration: import('apify').ProxyConfiguration | undefined;
 
 if (proxy?.useApifyProxy !== false) {
     const groups = proxy?.apifyProxyGroups ?? ['RESIDENTIAL'];
+    const proxyCountryCode = proxyCountry?.toUpperCase() || undefined;
     proxyConfiguration = await Actor.createProxyConfiguration({
         groups,
-        countryCode: country.toUpperCase(),
+        ...(proxyCountryCode ? { countryCode: proxyCountryCode } : {}),
     });
-    crawleeLog.info(`Using Apify proxy group(s): ${JSON.stringify(groups)}`);
+    crawleeLog.info(`Using Apify proxy group(s): ${JSON.stringify(groups)}, country: ${proxyCountryCode ?? 'auto'}`);
 } else if (proxy?.proxyUrls && proxy.proxyUrls.length > 0) {
     proxyConfiguration = await Actor.createProxyConfiguration({
         proxyUrls: proxy.proxyUrls,
