@@ -303,11 +303,9 @@ async function fetchFbTokensViaBrowser(
                     await route.continue();
                 });
 
-                // Monitor the Ad Library page response status — just log, don't block.
-                // We handle 403 (__rd_verify challenge) by waiting for the JS to reload the page.
-                // Using route.fetch() caused deadlocks (second HTTP request times out while
-                // the browser is still waiting for the original response).
-                page.on('response', (resp) => {
+                // Monitor Ad Library page navigations (403 challenge → 302 redirect → 200).
+                // Use context listener so redirects to web.facebook.com are also captured.
+                page.context().on('response', (resp) => {
                     const url = resp.url();
                     if (url.includes('/ads/library') && !url.includes('async') && !url.includes('graphql')) {
                         crawleeLog.info(`Ad Library page response: ${resp.status()} for ${url.slice(0, 80)}`);
@@ -315,9 +313,10 @@ async function fetchFbTokensViaBrowser(
                 });
 
                 // Passively capture async/search_ads responses the browser makes while rendering.
-                // These are authentic AJAX responses with full ad data — no token replication needed.
+                // Register on the browser CONTEXT (not just the page) so the listener
+                // survives redirects (e.g. facebook.com → web.facebook.com 302).
                 const capturedBodies: string[] = [];
-                page.on('response', async (resp) => {
+                page.context().on('response', async (resp) => {
                     const url = resp.url();
                     if (!url.includes('async/search_ads') && !url.includes('api/graphql')) return;
                     if (resp.status() < 200 || resp.status() >= 300) return;
