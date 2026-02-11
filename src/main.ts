@@ -564,7 +564,7 @@ async function fetchFbTokensViaBrowser(
                 for (const s of allScripts) {
                     const text = s.textContent ?? '';
                     if (text.includes('adArchiveID')) {
-                        return text.slice(0, 50000); // cap at 50KB
+                        return text; // full text — no cap
                     }
                 }
 
@@ -572,7 +572,7 @@ async function fetchFbTokensViaBrowser(
                 for (const s of allScripts) {
                     const text = s.textContent ?? '';
                     if (text.includes('__bbox') || text.includes('ScheduledServerJS')) {
-                        if (text.length > 1000) return text.slice(0, 50000);
+                        if (text.length > 1000) return text;
                     }
                 }
 
@@ -836,11 +836,30 @@ for (const sourceURL of initialURLs) {
 
     crawleeLog.info(`Processing ${tokens.capturedSearchResponses.length} captured browser response(s)...`);
     for (const body of tokens.capturedSearchResponses) {
-        // Use HTML parser for full page content, JSON parser for async API responses
-        const rawAds = body.trimStart().startsWith('<')
-            ? parseAdsFromPageHtml(body)
-            : parseAdsFromResponseText(body);
-        crawleeLog.info(`  → ${rawAds.length} ads found in captured response (${body.trimStart().startsWith('<') ? 'HTML' : 'JSON'})`);
+        const trimmed = body.trimStart();
+        let rawAds: RawAd[];
+        let sourceType: string;
+        if (trimmed.startsWith('<')) {
+            // Full page HTML
+            rawAds = parseAdsFromPageHtml(body);
+            sourceType = 'HTML';
+        } else if (trimmed.includes('ScheduledServerJS') || trimmed.includes('__bbox')) {
+            // Facebook ScheduledServerJS blob — single large JSON, use findAdsInObject directly
+            sourceType = 'SSR-blob';
+            rawAds = [];
+            try {
+                const json = JSON.parse(trimmed);
+                rawAds = findAdsInObject(json);
+            } catch {
+                // If direct parse fails, fall back to marker-based extraction
+                rawAds = parseAdsFromPageHtml(body);
+            }
+        } else {
+            // Async API response — newline-delimited JSON
+            rawAds = parseAdsFromResponseText(body);
+            sourceType = 'async-JSON';
+        }
+        crawleeLog.info(`  → ${rawAds.length} ads found in captured response (${sourceType})`);
         for (const raw of rawAds) {
             if (maxItems > 0 && ads.length >= maxItems) break;
             const processed = processAd(raw, customData);
