@@ -62,7 +62,7 @@
             "editor": "proxy",
             "prefill": {
                 "useApifyProxy": true,
-                "apifyProxyGroups": ["SHADER"]
+                "apifyProxyGroups": ["RESIDENTIAL"]
             }
         },
         "customData": {

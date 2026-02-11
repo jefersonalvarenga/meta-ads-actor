@@ -732,7 +732,7 @@ let proxyConfiguration: import('apify').ProxyConfiguration | undefined;
 let proxyUrl: string | undefined;
 
 if (proxy?.useApifyProxy !== false) {
-    const groups = proxy?.apifyProxyGroups ?? ['SHADER'];
+    const groups = proxy?.apifyProxyGroups ?? ['RESIDENTIAL'];
     proxyConfiguration = await Actor.createProxyConfiguration({
         groups,
         countryCode: country.toUpperCase(),
