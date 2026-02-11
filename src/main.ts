@@ -241,7 +241,7 @@ async function fetchFbTokensViaBrowser(
     const warmupCrawler = new PlaywrightCrawler({
         proxyConfiguration: pinnedProxyConfig,
         maxRequestsPerCrawl: 1,
-        requestHandlerTimeoutSecs: 120,
+        requestHandlerTimeoutSecs: 90,
         navigationTimeoutSecs: 60,
         maxSessionRotations: 0,   // don't rotate — we pinned a proxy IP
         // Facebook returns 403 for the __rd_verify bot-challenge page — that is expected.
@@ -363,29 +363,47 @@ async function fetchFbTokensViaBrowser(
             const hasAdsLib = htmlAfterChallenge.includes('AdsLibrary') || htmlAfterChallenge.includes('ads/library');
             log.info(`Page state: hasVerify=${hasVerify}, hasLoginForm=${hasLoginForm}, hasAdsLib=${hasAdsLib}, size=${htmlAfterChallenge.length}`);
 
-            // Wait for the ad feed to mount — up to 30 seconds.
-            // Facebook's React app can take a while to hydrate after the challenge clears.
+            // Dismiss the login modal if Facebook shows one.
+            // The Ad Library is public — the modal is an upsell overlay, not a hard gate.
+            try {
+                const closeBtn = await page.waitForSelector(
+                    '[aria-label="Close"], [data-testid="dialog-dismiss-button"], div[role="dialog"] [aria-label*="lose"]',
+                    { timeout: 5000 }
+                );
+                await closeBtn?.click();
+                log.info('Dismissed login modal');
+                await page.waitForTimeout(1000);
+            } catch { /* no modal, that's fine */ }
+
+            // Also press Escape to close any overlay
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(500);
+
+            // Wait up to 15s for ANY ad feed selector to appear.
+            // All selectors are tried in parallel via Promise.any.
             const FEED_SELECTORS = [
                 '[data-pagelet="AdsLibrary"]',
                 '[data-testid="ads-library-results"]',
                 '._8nfl',
-                '[class*="x1qhmfi1"]',   // common Ads Library result container class
                 'div[role="feed"]',
             ];
             let feedMounted = false;
-            for (const selector of FEED_SELECTORS) {
-                try {
-                    await page.waitForSelector(selector, { timeout: 30000 });
-                    log.info(`Feed mounted — found selector: ${selector}`);
-                    feedMounted = true;
-                    break;
-                } catch { /* try next */ }
+            try {
+                const found = await Promise.any(
+                    FEED_SELECTORS.map(sel =>
+                        page.waitForSelector(sel, { timeout: 15000 }).then(() => sel)
+                    )
+                );
+                log.info(`Feed mounted — found selector: ${found}`);
+                feedMounted = true;
+            } catch {
+                // None of the selectors appeared in 15s
             }
 
             if (!feedMounted) {
                 // Log what we actually see for debugging
                 const bodySnippet = await page.evaluate((): string => document.body.innerText.slice(0, 500).replace(/\n/g, ' '));
-                log.warning(`Feed did NOT mount after 30s. Body snippet: "${bodySnippet}"`);
+                log.warning(`Feed did NOT mount. Body snippet: "${bodySnippet}"`);
                 // Save screenshot for debugging
                 try {
                     const screenshotBuf = await page.screenshot({ fullPage: false });
