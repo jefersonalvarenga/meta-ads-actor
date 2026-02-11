@@ -488,6 +488,37 @@ async function fetchFbTokensViaBrowser(
                 await page.addInitScript(() => {
                     Object.defineProperty(navigator, 'webdriver', { get: () => false });
                 });
+
+                // Block heavy resources that aren't needed for scraping.
+                // This reduces proxy data usage by ~80% (images, fonts, media, trackers).
+                const BLOCKED_RESOURCE_TYPES = new Set([
+                    'image', 'media', 'font', 'stylesheet',
+                ]);
+                // Also block third-party domains that add weight but no data value
+                const BLOCKED_DOMAINS = [
+                    'google-analytics.com', 'doubleclick.net', 'googlesyndication.com',
+                    'facebook.net', // pixel / analytics (different from facebook.com)
+                    'connect.facebook.net',
+                    'static.xx.fbcdn.net', // CDN static assets
+                    'scontent', // user-generated media CDN
+                    'video.f', // video CDN
+                ];
+                await page.route('**/*', async (route) => {
+                    const req = route.request();
+                    const resourceType = req.resourceType();
+                    const url = req.url();
+
+                    if (BLOCKED_RESOURCE_TYPES.has(resourceType)) {
+                        await route.abort();
+                        return;
+                    }
+                    if (BLOCKED_DOMAINS.some(d => url.includes(d))) {
+                        await route.abort();
+                        return;
+                    }
+                    await route.continue();
+                });
+
                 // Intercept the Ad Library page: if Facebook returns 403 with the
                 // __rd_verify challenge, re-fulfill as 200 so crawlee does NOT abort.
                 // The browser will still execute the inline JS (fetch + reload).
