@@ -396,6 +396,8 @@ interface FbTokens {
     cookies: string;
     dtsg: string;
     lsd: string;
+    /** The exact proxy URL used by the browser — HTTP calls must use this same IP */
+    proxyUrl: string | undefined;
 }
 
 function cookieMapToHeader(map: Record<string, string>): string {
@@ -433,10 +435,20 @@ async function fetchFbTokensViaBrowser(
     searchUrl: string,
     proxyConfiguration: import('apify').ProxyConfiguration | undefined,
 ): Promise<FbTokens> {
-    let result: FbTokens = { cookies: '', dtsg: '', lsd: '' };
+    // Pin a single proxy URL so that both the browser warmup AND the subsequent
+    // HTTP calls hit the exact same IP — the rd_challenge cookie is IP-bound.
+    const pinnedProxyUrl = await proxyConfiguration?.newUrl('warmup_session') ?? undefined;
+    crawleeLog.info(`Pinned proxy URL for this session: ${pinnedProxyUrl ? 'set' : 'none'}`);
+
+    let result: FbTokens = { cookies: '', dtsg: '', lsd: '', proxyUrl: pinnedProxyUrl };
+
+    // Create a proxy configuration that always returns the same pinned URL
+    const pinnedProxyConfig = pinnedProxyUrl
+        ? await Actor.createProxyConfiguration({ proxyUrls: [pinnedProxyUrl] })
+        : proxyConfiguration;
 
     const warmupCrawler = new PlaywrightCrawler({
-        proxyConfiguration,
+        proxyConfiguration: pinnedProxyConfig,
         maxRequestsPerCrawl: 1,
         requestHandlerTimeoutSecs: 90,
         navigationTimeoutSecs: 60,
@@ -526,10 +538,31 @@ async function fetchFbTokensViaBrowser(
             const cookieHeader = cookieMapToHeader(cookieMap);
             log.info(`Browser cookies: ${Object.keys(cookieMap).join(', ')}`);
 
-            const { dtsg, lsd } = extractTokensFromHtml(html);
-            log.info(`Tokens — dtsg: ${dtsg ? 'OK' : 'MISSING'}, lsd: ${lsd ? 'OK' : 'MISSING'}`);
+            // Try extracting dtsg from window.__bbox (in-memory Relay store) first,
+            // then fall back to HTML regex patterns.
+            let dtsg = '';
+            try {
+                dtsg = await page.evaluate((): string => {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const bbox = (window as any).__bbox;
+                    if (!bbox) return '';
+                    // Walk bbox looking for dtsg token
+                    function find(obj: unknown, depth: number): string {
+                        if (depth > 6 || !obj || typeof obj !== 'object') return '';
+                        const r = obj as Record<string, unknown>;
+                        if (typeof r['token'] === 'string' && (r['token'] as string).startsWith('AQ')) return r['token'] as string;
+                        for (const v of Object.values(r)) { const t = find(v, depth + 1); if (t) return t; }
+                        return '';
+                    }
+                    return find(bbox, 0);
+                });
+            } catch { /* ignore */ }
 
-            result = { cookies: cookieHeader, dtsg, lsd };
+            const { dtsg: dtsgHtml, lsd } = extractTokensFromHtml(html);
+            if (!dtsg) dtsg = dtsgHtml;
+            log.info(`Tokens — dtsg: ${dtsg ? 'OK (' + dtsg.slice(0, 8) + '...)' : 'MISSING'}, lsd: ${lsd ? 'OK (' + lsd + ')' : 'MISSING'}`);
+
+            result = { cookies: cookieHeader, dtsg, lsd, proxyUrl: pinnedProxyUrl };
         },
 
         failedRequestHandler({ log }, error) {
@@ -747,9 +780,8 @@ const initialURLs: string[] =
 
 crawleeLog.info(`Starting scrape for ${initialURLs.length} URL(s). maxItems=${maxItems}, endPage=${endPage}`);
 
-// Build proxy configuration (shared between Playwright warmup and HTTP calls)
+// Build proxy configuration — used by the browser warmup to pin a session IP
 let proxyConfiguration: import('apify').ProxyConfiguration | undefined;
-let proxyUrl: string | undefined;
 
 if (proxy?.useApifyProxy !== false) {
     const groups = proxy?.apifyProxyGroups ?? ['RESIDENTIAL'];
@@ -757,11 +789,12 @@ if (proxy?.useApifyProxy !== false) {
         groups,
         countryCode: country.toUpperCase(),
     });
-    proxyUrl = await proxyConfiguration?.newUrl() ?? undefined;
     crawleeLog.info(`Using Apify proxy group(s): ${JSON.stringify(groups)}`);
 } else if (proxy?.proxyUrls && proxy.proxyUrls.length > 0) {
-    proxyUrl = proxy.proxyUrls[0];
-    crawleeLog.info(`Using custom proxy URL`);
+    proxyConfiguration = await Actor.createProxyConfiguration({
+        proxyUrls: proxy.proxyUrls,
+    });
+    crawleeLog.info(`Using custom proxy URLs`);
 } else {
     crawleeLog.warning('No proxy configured — Facebook will likely block datacenter IPs!');
 }
@@ -805,11 +838,14 @@ for (const sourceURL of initialURLs) {
     }
 
     // Step 2: Call async API with pagination (pure HTTP, no browser)
+    // IMPORTANT: use tokens.proxyUrl — the exact same IP the browser used,
+    // because rd_challenge cookies are bound to that IP.
     const remaining = maxItems > 0 ? maxItems - totalScraped : 0;
+    crawleeLog.info(`Using pinned proxy for HTTP calls: ${tokens.proxyUrl ? 'set' : 'none'}`);
     const ads = await scrapeViaAsyncAPI(
         searchParams,
         tokens,
-        proxyUrl,
+        tokens.proxyUrl,
         remaining,
         endPage,
         sourceURL,
