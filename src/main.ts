@@ -399,15 +399,104 @@ interface FbTokens {
 }
 
 /**
- * Fetches the Ad Library page (HTML only, no JS execution) to extract
- * the fb_dtsg token and cookies needed for the async API calls.
+ * Merges Set-Cookie headers from a response into an existing cookie map.
+ * Returns the updated map.
+ */
+function mergeCookies(
+    existing: Record<string, string>,
+    setCookieHeaders: string[] | undefined,
+): Record<string, string> {
+    for (const cookieLine of setCookieHeaders ?? []) {
+        const part = cookieLine.split(';')[0].trim();
+        const eqIdx = part.indexOf('=');
+        if (eqIdx > 0) {
+            existing[part.slice(0, eqIdx).trim()] = part.slice(eqIdx + 1).trim();
+        }
+    }
+    return existing;
+}
+
+function cookieMapToHeader(map: Record<string, string>): string {
+    return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function extractTokensFromHtml(html: string): { dtsg: string; lsd: string } {
+    const dtsgMatch = html.match(/"token"\s*:\s*"(AQ[^"]{10,})"/)
+        ?? html.match(/"dtsg"\s*[^}]*"token"\s*:\s*"([^"]+)"/)
+        ?? html.match(/name="fb_dtsg"\s+value="([^"]+)"/)
+        ?? html.match(/"DTSGInitialData"[^}]{0,200}"token":"([^"]+)"/)
+        ?? html.match(/\["DTSGInitData",[^\]]*,"([^"]+)"/)
+        ?? html.match(/fb_dtsg[^"]*"([^"]{20,})"/);
+    const dtsg = dtsgMatch?.[1] ?? '';
+
+    const lsdMatch = html.match(/"LSD"\s*,\s*\[\]\s*,\s*\{"token"\s*:\s*"([^"]+)"/)
+        ?? html.match(/name="lsd"\s+value="([^"]+)"/)
+        ?? html.match(/"token":"([A-Za-z0-9_\-]{8,20})"[^}]*"ttl"/)
+        ?? html.match(/"lsd"\s*:\s*\{\s*"token"\s*:\s*"([^"]+)"/)
+        ?? html.match(/\["LSD"[^\]]*"([A-Za-z0-9_\-]{6,20})"\]/);
+    const lsd = lsdMatch?.[1] ?? '';
+
+    return { dtsg, lsd };
+}
+
+/**
+ * Fetches tokens and cookies needed for the async API.
+ * Strategy:
+ *   1. GET facebook.com to establish a session and collect initial cookies (datr, etc.)
+ *   2. GET the Ad Library page with those cookies to get lsd/dtsg tokens
  */
 async function fetchFbTokens(
     searchUrl: string,
     proxyUrl: string | undefined,
 ): Promise<FbTokens> {
-    const response = await gotScraping({
+    const cookieMap: Record<string, string> = {};
+
+    const commonHeaders = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+    };
+
+    // Step 1: GET facebook.com homepage to collect datr / initial session cookies
+    crawleeLog.info('Step 1: GET facebook.com for initial cookies...');
+    try {
+        const homeResp = await gotScraping({
+            url: 'https://www.facebook.com/',
+            headers: commonHeaders,
+            headerGeneratorOptions: {
+                browsers: [{ name: 'chrome', minVersion: 120 }],
+                operatingSystems: ['windows'],
+                locales: ['en-US'],
+            },
+            proxyUrl,
+            followRedirect: true,
+            timeout: { request: 30000 },
+        });
+        crawleeLog.info(`homepage status: ${homeResp.statusCode}, cookies: ${(homeResp.headers['set-cookie'] as string[] | undefined)?.length ?? 0}`);
+        mergeCookies(cookieMap, homeResp.headers['set-cookie'] as string[] | undefined);
+    } catch (err) {
+        crawleeLog.warning(`homepage GET failed: ${(err as Error).message}`);
+    }
+
+    // Small delay between requests
+    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
+
+    // Step 2: GET the Ad Library page to get lsd/dtsg tokens
+    crawleeLog.info(`Step 2: GET Ad Library page for tokens...`);
+    const adLibResp = await gotScraping({
         url: searchUrl,
+        headers: {
+            ...commonHeaders,
+            'Referer': 'https://www.facebook.com/',
+            'Cookie': cookieMapToHeader(cookieMap),
+        },
         headerGeneratorOptions: {
             browsers: [{ name: 'chrome', minVersion: 120 }],
             operatingSystems: ['windows'],
@@ -418,38 +507,18 @@ async function fetchFbTokens(
         timeout: { request: 30000 },
     });
 
-    const html = response.body as string;
-    const rawCookies = (response.headers['set-cookie'] as string[] | undefined) ?? [];
+    crawleeLog.info(`Ad Library page status: ${adLibResp.statusCode}, size: ${(adLibResp.body as string).length} chars`);
+    mergeCookies(cookieMap, adLibResp.headers['set-cookie'] as string[] | undefined);
 
-    // Parse cookies into a single header string
-    const cookieMap: Record<string, string> = {};
-    for (const cookieLine of rawCookies) {
-        const part = cookieLine.split(';')[0].trim();
-        const eqIdx = part.indexOf('=');
-        if (eqIdx > 0) {
-            const k = part.slice(0, eqIdx).trim();
-            const v = part.slice(eqIdx + 1).trim();
-            cookieMap[k] = v;
-        }
-    }
-    const cookieHeader = Object.entries(cookieMap)
-        .map(([k, v]) => `${k}=${v}`)
-        .join('; ');
+    const html = adLibResp.body as string;
 
-    // Extract fb_dtsg token
-    const dtsgMatch = html.match(/"dtsg"\s*:\s*\{"token"\s*:\s*"([^"]+)"/)
-        ?? html.match(/name="fb_dtsg"\s+value="([^"]+)"/)
-        ?? html.match(/"DTSGInitialData"[^}]*"token":"([^"]+)"/)
-        ?? html.match(/\["DTSGInitData",[^\]]*,"([^"]+)"/);
-    const dtsg = dtsgMatch?.[1] ?? '';
+    // Log first 500 chars for diagnosis
+    crawleeLog.info(`HTML preview: ${html.slice(0, 500).replace(/\n/g, ' ')}`);
 
-    // Extract lsd token
-    const lsdMatch = html.match(/"LSD"\s*,\s*\[\]\s*,\s*\{"token"\s*:\s*"([^"]+)"/)
-        ?? html.match(/name="lsd"\s+value="([^"]+)"/)
-        ?? html.match(/"lsd"\s*:\s*"([^"]+)"/);
-    const lsd = lsdMatch?.[1] ?? '';
+    const { dtsg, lsd } = extractTokensFromHtml(html);
+    const cookieHeader = cookieMapToHeader(cookieMap);
 
-    crawleeLog.info(`Tokens extracted — dtsg: ${dtsg ? 'OK' : 'MISSING'}, lsd: ${lsd ? 'OK' : 'MISSING'}, cookies: ${cookieHeader.length} chars`);
+    crawleeLog.info(`Tokens — dtsg: ${dtsg ? 'OK (' + dtsg.slice(0, 8) + '...)' : 'MISSING'}, lsd: ${lsd ? 'OK (' + lsd + ')' : 'MISSING'}, cookies: ${cookieHeader.length} chars (${Object.keys(cookieMap).join(', ')})`);
 
     return { cookies: cookieHeader, dtsg, lsd };
 }
@@ -532,11 +601,12 @@ async function scrapeViaAsyncAPI(
         }
 
         const adsOnPage = parseAdsFromResponseText(responseText);
-        crawleeLog.info(`Page ${pageNum + 1}: found ${adsOnPage.length} ads in response`);
+        crawleeLog.info(`Page ${pageNum + 1}: found ${adsOnPage.length} ads in response (response size: ${responseText.length})`);
 
         if (adsOnPage.length === 0) {
-            // No more results
-            crawleeLog.info('No ads returned — reached end of results.');
+            // Log first 800 chars to help diagnose what Facebook returned
+            crawleeLog.info(`Response preview: ${responseText.slice(0, 800).replace(/\n/g, ' ')}`);
+            crawleeLog.info('No ads returned — reached end of results or blocked.');
             break;
         }
 
