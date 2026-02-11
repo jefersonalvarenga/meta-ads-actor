@@ -244,7 +244,10 @@ async function fetchFbTokensViaBrowser(
         requestHandlerTimeoutSecs: 120,
         navigationTimeoutSecs: 60,
         maxSessionRotations: 0,   // don't rotate — we pinned a proxy IP
-        sessionPoolOptions: { maxPoolSize: 1 },
+        // Facebook returns 403 for the __rd_verify bot-challenge page — that is expected.
+        // The browser MUST load and execute the inline JS to solve the challenge.
+        // Setting blockedStatusCodes to [] prevents crawlee from retiring the session on 403.
+        sessionPoolOptions: { maxPoolSize: 1, blockedStatusCodes: [] },
 
         launchContext: {
             launchOptions: {
