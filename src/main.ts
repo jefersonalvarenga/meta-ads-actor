@@ -461,62 +461,78 @@ function findAdsInObject(obj: unknown, depth = 0): RawAd[] {
 }
 
 /**
- * Extracts ads from the page HTML.
- * Facebook embeds ad data in inline <script> tags using require() / __d() patterns.
- * We grab the full HTML and search for JSON chunks containing ad archive IDs.
+ * Extracts ads from the live page by walking the Facebook Relay/Flux store in memory.
+ * Facebook stores ad data in window.__bbox.require calls and in the Relay record store.
+ * We use page.evaluate() to walk the in-memory objects and find ad records.
  */
 async function extractAdsFromDOM(page: Page, sourceURL: string, customData: Record<string, unknown> | null = null): Promise<ProcessedAd[]> {
     const ads: ProcessedAd[] = [];
     try {
-        const html = await page.content();
-        if (!html.includes('adArchiveID') && !html.includes('ad_archive_id')) return ads;
+        // Ask the browser to walk every object in the Relay/bootstrap store
+        // and collect anything that looks like an ad archive record.
+        const rawAds = await page.evaluate((): unknown[] => {
+            const results: unknown[] = [];
+            const seen = new Set<string>();
 
-        // Extract all JSON-like blobs from the HTML.
-        // Facebook wraps data in: require("TimeSliceImpl").collectDataForCapture(...)
-        // or: __d("...",[],(function(...){})); or plain JSON objects in <script> tags.
-        // Strategy: find all occurrences of adArchiveID and extract surrounding JSON object.
-        const marker = '"adArchiveID"';
-        let pos = 0;
-        while (pos < html.length) {
-            const idx = html.indexOf(marker, pos);
-            if (idx === -1) break;
-            pos = idx + marker.length;
-
-            // Walk back to find the opening '{' of the object containing this key
-            let depth = 0;
-            let start = -1;
-            for (let i = idx; i >= Math.max(0, idx - 5000); i--) {
-                if (html[i] === '}') depth++;
-                else if (html[i] === '{') {
-                    if (depth === 0) { start = i; break; }
-                    depth--;
-                }
+            function isAdLike(o: unknown): o is Record<string, unknown> {
+                if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+                const r = o as Record<string, unknown>;
+                return Boolean(r['adArchiveID'] || r['adid'] || r['ad_archive_id']);
             }
-            if (start === -1) continue;
 
-            // Walk forward to find the matching closing '}'
-            depth = 0;
-            let end = -1;
-            for (let i = start; i < Math.min(html.length, start + 50000); i++) {
-                if (html[i] === '{') depth++;
-                else if (html[i] === '}') {
-                    depth--;
-                    if (depth === 0) { end = i; break; }
+            function walk(obj: unknown, depth: number): void {
+                if (depth > 8 || obj === null || typeof obj !== 'object') return;
+                if (Array.isArray(obj)) {
+                    for (const item of obj) walk(item, depth + 1);
+                    return;
                 }
-            }
-            if (end === -1) continue;
-
-            const chunk = html.slice(start, end + 1);
-            try {
-                const parsed = JSON.parse(chunk);
-                if (isAdObject(parsed as Record<string, unknown>)) {
-                    const processed = processAd(parsed as unknown as RawAd, sourceURL, customData);
-                    if (processed && !ads.find(a => a.adArchiveID === processed.adArchiveID)) {
-                        ads.push(processed);
+                const rec = obj as Record<string, unknown>;
+                const id = String(rec['adArchiveID'] ?? rec['adid'] ?? rec['ad_archive_id'] ?? '');
+                if (id && isAdLike(rec)) {
+                    if (!seen.has(id)) {
+                        seen.add(id);
+                        results.push(rec);
                     }
+                    return; // don't recurse into an ad object itself
                 }
-            } catch {
-                // chunk is not valid standalone JSON — skip
+                for (const val of Object.values(rec)) walk(val, depth + 1);
+            }
+
+            // 1. Walk window.__bbox (Facebook's server-side bootstrap data)
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const bbox = (window as any).__bbox;
+                if (bbox) walk(bbox, 0);
+            } catch { /* ignore */ }
+
+            // 2. Walk window.require.s (Bootloader module registry)
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const reqS = (window as any).require?.s?.entries;
+                if (reqS) walk(reqS, 0);
+            } catch { /* ignore */ }
+
+            // 3. Walk all inline <script> tags that contain JSON-like data
+            try {
+                const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+                for (const script of scripts) {
+                    const text = (script.textContent ?? '').trim();
+                    // Only process JSON-like scripts (start with { or [)
+                    if (!text.startsWith('{') && !text.startsWith('[')) continue;
+                    try {
+                        const parsed: unknown = JSON.parse(text);
+                        walk(parsed, 0);
+                    } catch { /* not pure JSON */ }
+                }
+            } catch { /* ignore */ }
+
+            return results;
+        });
+
+        for (const raw of rawAds) {
+            const processed = processAd(raw as RawAd, sourceURL, customData);
+            if (processed && !ads.find(a => a.adArchiveID === processed.adArchiveID)) {
+                ads.push(processed);
             }
         }
     } catch {
@@ -795,33 +811,33 @@ const crawler = new PlaywrightCrawler({
             if (responseHandler) page.off('response', responseHandler);
         }
 
-        const seenNetworkUrls = (request.userData['seenNetworkUrls'] as string[]) ?? [];
         log.info(`Page title: "${pageTitle}" | URL after load: ${page.url()}`);
         log.info(`GraphQL ads collected via network: ${collectedAds.length}`);
-        log.info(`GraphQL responses seen: ${JSON.stringify(seenNetworkUrls)}`);
-        if (collectedAds.length === 0) {
-            const fullText = await page.evaluate(() => document.body?.innerText?.slice(0, 800) ?? '').catch(() => '');
-            log.info(`Full page text (800 chars): ${fullText.replace(/\n+/g, ' ')}`);
-        }
 
-        // If network interception found no ads, try DOM extraction
-        if (collectedAds.length === 0) {
-            log.warning('No ads found via network interception, trying DOM fallback...');
-            const domAds = await extractAdsFromDOM(page, sourceURL, customData);
-            if (domAds.length > 0) {
-                log.info(`DOM fallback found ${domAds.length} ads`);
-                for (const ad of domAds) {
-                    if (seenAdIDs.has(ad.adArchiveID)) continue;
-                    seenAdIDs.add(ad.adArchiveID);
-                    await Actor.pushData(ad);
-                    totalScraped++;
-                    if (maxItems > 0 && totalScraped >= maxItems) break;
-                }
-                return;
+        // Always try DOM/memory extraction — it may have richer data even when GraphQL worked
+        log.info('Extracting ads from in-memory Relay store (window.__bbox)...');
+        const domAds = await extractAdsFromDOM(page, sourceURL, customData);
+        log.info(`In-memory extraction found ${domAds.length} ads`);
+        // Merge: add DOM ads not already found via GraphQL
+        for (const domAd of domAds) {
+            if (!collectedAds.find(r => {
+                const rid = r.adArchiveID ?? r.adid ?? r.ad_archive_id;
+                return String(rid) === domAd.adArchiveID;
+            })) {
+                // Push as a pre-processed ad directly
+                if (seenAdIDs.has(domAd.adArchiveID)) continue;
+                seenAdIDs.add(domAd.adArchiveID);
+                await Actor.pushData(domAd);
+                totalScraped++;
+                if (maxItems > 0 && totalScraped >= maxItems) break;
             }
         }
+        if (maxItems > 0 && totalScraped >= maxItems) {
+            log.info(`Reached maxItems (${maxItems}) from DOM extraction, stopping.`);
+            return;
+        }
 
-        // Process and save intercepted ads
+        // Process and save intercepted GraphQL ads (not already saved via DOM)
         for (const raw of collectedAds) {
             if (maxItems > 0 && totalScraped >= maxItems) break;
             const processed = processAd(raw, sourceURL, customData);
